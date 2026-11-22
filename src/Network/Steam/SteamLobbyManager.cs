@@ -17,6 +17,48 @@ namespace GraveyardKeeperCoop.Network
         public const string LobbyDataDLC = "dlc";
         public const string LobbyDataModVersion = "mod_version";
         public const string LobbyDataProtocolRevision = "protocol_revision";
+        // GKMP: game build advertised by the host. Windows and native Linux players can end up
+        // on different game builds; the mod version check does not cover that, so warn on mismatch.
+        public const string LobbyDataGameVersion = "game_version";
+
+        /// <summary>
+        /// Runtime game version (LazyConsts.VERSION, e.g. 1.407). Read the property, not the
+        /// VERSION_INT const, so the value comes from the installed game rather than being
+        /// baked into this DLL at compile time.
+        /// </summary>
+        internal static string GetLocalGameVersion()
+        {
+            try
+            {
+                return LazyConsts.VERSION.ToString("0.000", System.Globalization.CultureInfo.InvariantCulture);
+            }
+            catch (Exception e)
+            {
+                CoopMod.Logger.LogWarning($"[LOBBY] Could not read game version: {e.Message}");
+                return "";
+            }
+        }
+
+        /// <summary>
+        /// Non-blocking: logs both versions and posts a chat warning when they differ.
+        /// Hosts running an older mod build do not advertise a version; that is only logged.
+        /// </summary>
+        private void WarnOnGameVersionMismatch(string hostGameVersion)
+        {
+            string local = GetLocalGameVersion();
+            CoopMod.Logger.LogInfo(
+                $"[LOBBY] Game version: local {local} ({Application.platform}), " +
+                $"host {(string.IsNullOrEmpty(hostGameVersion) ? "not advertised" : hostGameVersion)}");
+            if (string.IsNullOrEmpty(hostGameVersion) || string.IsNullOrEmpty(local) ||
+                string.Equals(local, hostGameVersion, StringComparison.Ordinal))
+                return;
+
+            CoopMod.Logger.LogWarning(
+                $"[LOBBY] Game version mismatch: local {local}, host {hostGameVersion}. Expect desyncs.");
+            PostChatMessage(
+                $"[System] Warning: your game version {local} differs from the host's {hostGameVersion}. " +
+                "Update both games to the same version.");
+        }
         private const float MemberCompatibilityValidationTimeout = 3f;
         private const float InviteCompatibilityLookupTimeout = 3f;
 
@@ -772,6 +814,7 @@ namespace GraveyardKeeperCoop.Network
             SetLobbyData("mod", PluginInfo.PLUGIN_DISPLAY_NAME);
             SetLobbyData(LobbyDataModVersion, PluginInfo.PLUGIN_VERSION);
             SetLobbyData(LobbyDataProtocolRevision, CoopProtocol.Revision);
+            SetLobbyData(LobbyDataGameVersion, GetLocalGameVersion());
             SetLobbyData("host_name", SteamFriends.GetPersonaName());
             SetLobbyData("max_players", ModConfig.MaxPlayers.Value.ToString());
             SetLobbyData("visibility", currentSessionVisibility.ToString());
@@ -850,6 +893,7 @@ namespace GraveyardKeeperCoop.Network
                     return;
                 }
 
+                WarnOnGameVersionMismatch(GetLobbyData(LobbyDataGameVersion));
             }
 
             InitializeReliableTransport(currentLobbyID);
