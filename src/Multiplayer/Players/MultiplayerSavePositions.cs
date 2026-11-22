@@ -225,7 +225,9 @@ namespace GraveyardKeeperCoop.Multiplayer
                 CoopMod.Logger.LogWarning($"[MultiplayerSavePositions] Joiner ordinal lookup failed, using 1: {ex.Message}");
             }
 
-            const float JoinerSpawnOffset = 96f;
+            // save.player_position is a localPosition under MainGame.world_root, which is
+            // scaled by 96: one unit here is one tile (= the proxies' 96 world-unit offset).
+            const float JoinerSpawnOffset = 1f;
             Vector3 oldPosition = MainGame.me.save.player_position;
             Vector3 newPosition = oldPosition + new Vector3(JoinerSpawnOffset * ordinal, 0f, 0f);
             MainGame.me.save.player_position = newPosition;
