@@ -370,7 +370,7 @@ namespace GraveyardKeeperCoop.Multiplayer
         {
             ApplySucceededQuestParameterRepair(questId);
             if (StoryCatalogRuntime.GetPersonalRewardSource(questId) != null)
-                ApplySucceededQuestPersonalItemGrants(questId, true);
+                ApplySucceededQuestPersonalItemGrants(questId, true, isLocalAuthoritative: true);
             else
                 RecordSucceededQuestPersonalItemGrantReceipts(questId);
             ReconcilePersonalRewardSourceContainer(questId);
@@ -555,7 +555,8 @@ namespace GraveyardKeeperCoop.Multiplayer
             ApplyPersonalItemGrants(
                 StoryCatalogRuntime.GetCutscenePersonalItemGrants(scriptName),
                 $"authoritative cutscene '{scriptName}'",
-                grantFullObserverAllocation: false);
+                grantFullObserverAllocation: false,
+                isLocalAuthoritative: true);
         }
 
         public static void ApplyRemoteCutscenePersonalItemGrants(
@@ -735,7 +736,8 @@ namespace GraveyardKeeperCoop.Multiplayer
 
         private static void ApplySucceededQuestPersonalItemGrants(
             string questId,
-            bool grantFullObserverAllocation)
+            bool grantFullObserverAllocation,
+            bool isLocalAuthoritative = false)
         {
             OnlineCoopManager coop = OnlineCoopManager.Instance;
             WorldGameObject player = MainGame.me?.player;
@@ -751,7 +753,8 @@ namespace GraveyardKeeperCoop.Multiplayer
             ApplyPersonalItemGrants(
                 grants,
                 $"quest '{questId}'",
-                grantFullObserverAllocation);
+                grantFullObserverAllocation,
+                isLocalAuthoritative);
         }
 
         /// <summary>Bag (with nested bags) plus toolbelt: tools live on the toolbelt.</summary>
@@ -772,8 +775,19 @@ namespace GraveyardKeeperCoop.Multiplayer
         private static void ApplyPersonalItemGrants(
             StoryCatalogPersonalItemGrant[] grants,
             string source,
-            bool grantFullObserverAllocation)
+            bool grantFullObserverAllocation,
+            bool isLocalAuthoritative = false)
         {
+            // GKMP: by default story rewards are not copied to the partner. The player
+            // who earned them got them from vanilla; observer and catch-up grants only
+            // record their receipt so the item is never delivered later either.
+            if (!isLocalAuthoritative &&
+                ModConfig.ShareStoryRewardsWithPartner?.Value != true)
+            {
+                RecordPersonalItemGrantReceipts(grants, source);
+                return;
+            }
+
             OnlineCoopManager coop = OnlineCoopManager.Instance;
             WorldGameObject player = MainGame.me?.player;
             if (coop == null || !coop.IsOnlineCoopEnabled ||

@@ -25,6 +25,7 @@ namespace GraveyardKeeperCoop
         public static ConfigEntry<bool> EnableHostAuthorityInteractions;
         public static ConfigEntry<string> HostAuthorityObjectIds;
         public static ConfigEntry<bool> EnableJoinerProfilePersistence;
+        public static ConfigEntry<bool> ShareStoryRewardsWithPartner;
         public static ConfigEntry<bool> EnableNetworkDebugOverlay;
         public static ConfigEntry<bool> EnableSaveDiagnostics;
         public static ConfigEntry<bool> EnablePerformanceProfiling;
@@ -226,6 +227,11 @@ namespace GraveyardKeeperCoop
                 "EnableJoinerProfilePersistence",
                 true,
                 "Preserve a joiner's personal inventory and loadout after loading the host's save. Shared campaign progression remains host-authoritative.");
+
+            ShareStoryRewardsWithPartner = config.Bind("Network",
+                "ShareStoryRewardsWithPartner",
+                false,
+                "Give the other player a personal copy of story/tutorial rewards (prologue items, quest rewards) when one player earns them or when a player joins mid-story. Off: every story item exists once, with the player who earned it.");
 
             EnableNetworkDebugOverlay = config.Bind("Debug",
                 "EnableNetworkDebugOverlay",
