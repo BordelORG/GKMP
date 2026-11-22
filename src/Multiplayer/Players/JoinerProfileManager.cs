@@ -320,6 +320,11 @@ namespace GraveyardKeeperCoop.Multiplayer
                 // The downloaded save contains the host's local-player params.
                 // A new joiner starts with no personal receipts, then receives
                 // every catalogued reward whose shared quest is already complete.
+                // GKMP: the loaded bag is the host's bag. Start the joiner with an
+                // empty bag so story items (keys, pages, quest items) exist only once,
+                // with whoever really obtained them. The toolbelt (tools) is kept and
+                // the catalogued personal rewards below are delivered as usual.
+                ClearFreshJoinerBag();
                 QuestSideEffectSync.ClearPersonalGrantReceipts();
                 QuestSideEffectSync.ReconcileCurrentQuestEffects();
                 QuestSideEffectSync.ReconcileSucceededQuestEffects();
@@ -339,6 +344,24 @@ namespace GraveyardKeeperCoop.Multiplayer
 
             MarkAppliedForSession();
             applyCoroutine = null;
+        }
+
+        private static void ClearFreshJoinerBag()
+        {
+            Item data = MainGame.me?.player?.data;
+            if (data?.inventory == null)
+                return;
+
+            var removed = new List<string>();
+            foreach (Item item in data.inventory)
+            {
+                if (item != null && !item.IsEmpty())
+                    removed.Add($"{item.id}x{item.value}");
+            }
+            data.inventory.Clear();
+            CoopMod.Logger.LogInfo(
+                $"[JoinerProfile] Fresh joiner starts with an empty bag (host's copy dropped: " +
+                $"{(removed.Count == 0 ? "nothing" : string.Join(", ", removed))})");
         }
 
         private void MarkAppliedForSession()
