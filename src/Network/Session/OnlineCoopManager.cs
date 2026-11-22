@@ -1216,6 +1216,10 @@ namespace GraveyardKeeperCoop.Network
             try
             {
                 CoopMod.Logger.LogInfo("[OnlineCoopManager] Spawning remote player...");
+                // GKMP: a position can arrive before the proxy exists (the peer finished loading
+                // first). Keep it, otherwise an idle peer stays at the fallback spot.
+                bool hadEarlyNetworkPosition = hasReceivedRemotePlayerPosition;
+                Vector3 earlyNetworkPosition = targetRemotePosition;
                 hasReceivedRemotePlayerPosition = false;
                 remotePositionSeededFromSidecar = false;
                 
@@ -1271,6 +1275,20 @@ namespace GraveyardKeeperCoop.Network
                     positionedFromSave = true;
                     remotePositionSeededFromSidecar = true;
                     CoopMod.Logger.LogInfo($"[OnlineCoopManager] Remote player positioned from multiplayer save sidecar: {savedRemotePosition}");
+                }
+
+                if (hadEarlyNetworkPosition)
+                {
+                    remotePlayer.transform.position = earlyNetworkPosition;
+                    if (remotePlayer.wgo != null)
+                    {
+                        remotePlayer.wgo.transform.position = earlyNetworkPosition;
+                    }
+
+                    targetRemotePosition = earlyNetworkPosition;
+                    hasReceivedRemotePlayerPosition = true;
+                    positionedFromSave = true; // skip the fallback offset below
+                    CoopMod.Logger.LogInfo($"[OnlineCoopManager] Remote player positioned from a network position received before spawn: {earlyNetworkPosition}");
                 }
 
                 // Position near local player, but far enough that player colliders do not overlap.
@@ -3734,6 +3752,10 @@ namespace GraveyardKeeperCoop.Network
                     lastSentPosition = currentPos;
                     lastSentIsMoving = isMoving;
                     lastSentDirection = currentDir;
+                    // GKMP: reset the keepalive only on a real send. Resetting it on every
+                    // throttle tick meant an idle player never sent a keepalive, so a peer that
+                    // missed the single initial position kept showing them at a stale spot.
+                    lastKeepAliveTime = Time.realtimeSinceStartup;
                 }
                 
                 // Update throttle timer
@@ -3745,9 +3767,8 @@ namespace GraveyardKeeperCoop.Network
                 {
                     lastPositionSyncTime = Time.time;
                 }
-                lastKeepAliveTime = Time.realtimeSinceStartup;
             }
-            else if (!useIntroFollowPositioning && !isInCutscene && localPlayer != null && 
+            if (!useIntroFollowPositioning && !isInCutscene && localPlayer != null && 
                      Time.realtimeSinceStartup - lastKeepAliveTime >= KEEPALIVE_INTERVAL)
             {
                 // Keepalive: send current position even when idle to prevent heartbeat timeout

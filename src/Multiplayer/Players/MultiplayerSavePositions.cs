@@ -166,6 +166,7 @@ namespace GraveyardKeeperCoop.Multiplayer
                 if (!TryReadPositionFile(slot.filename_no_extension, out PositionFile data))
                 {
                     CoopMod.Logger.LogInfo($"[MultiplayerSavePositions] No multiplayer position sidecar for slot '{slot.filename_no_extension}'");
+                    ApplyJoinerFallbackOffset("no sidecar");
                     return false;
                 }
 
@@ -174,6 +175,7 @@ namespace GraveyardKeeperCoop.Multiplayer
                 if (entry == null)
                 {
                     CoopMod.Logger.LogWarning($"[MultiplayerSavePositions] Sidecar for '{slot.filename_no_extension}' has no entry for local SteamID {localSteamId.m_SteamID}");
+                    ApplyJoinerFallbackOffset("no sidecar entry");
                     return false;
                 }
 
@@ -188,6 +190,47 @@ namespace GraveyardKeeperCoop.Multiplayer
                 CoopMod.Logger.LogWarning($"[MultiplayerSavePositions] Failed to apply local position: {ex.Message}");
                 return false;
             }
+        }
+
+        /// <summary>
+        /// GKMP: a client without a saved coop position loads at the host's saved spot, so both
+        /// characters stand on the same tile and the client's proxy is hidden under the host on
+        /// the host's screen. Step the joiner aside by the same offset the proxies use
+        /// (OnlineCoopManager.FallbackRemoteSpawnOffset), one tile per joiner.
+        /// </summary>
+        private static void ApplyJoinerFallbackOffset(string reason)
+        {
+            var lobby = SteamLobbyManager.Instance;
+            if (lobby == null || !lobby.IsInLobby || lobby.IsHost || MainGame.me?.save == null)
+                return;
+
+            int ordinal = 1;
+            try
+            {
+                CSteamID lobbyId = lobby.CurrentLobbyID;
+                CSteamID owner = SteamMatchmaking.GetLobbyOwner(lobbyId);
+                CSteamID self = SteamUser.GetSteamID();
+                int count = SteamMatchmaking.GetNumLobbyMembers(lobbyId);
+                int joinersBefore = 0;
+                for (int i = 0; i < count; i++)
+                {
+                    CSteamID member = SteamMatchmaking.GetLobbyMemberByIndex(lobbyId, i);
+                    if (member == self) break;
+                    if (member != owner) joinersBefore++;
+                }
+                ordinal = joinersBefore + 1;
+            }
+            catch (Exception ex)
+            {
+                CoopMod.Logger.LogWarning($"[MultiplayerSavePositions] Joiner ordinal lookup failed, using 1: {ex.Message}");
+            }
+
+            const float JoinerSpawnOffset = 96f;
+            Vector3 oldPosition = MainGame.me.save.player_position;
+            Vector3 newPosition = oldPosition + new Vector3(JoinerSpawnOffset * ordinal, 0f, 0f);
+            MainGame.me.save.player_position = newPosition;
+            CoopMod.Logger.LogInfo(
+                $"[MultiplayerSavePositions] Joiner has no saved position ({reason}); stepped aside from the host: {oldPosition} -> {newPosition} (joiner #{ordinal})");
         }
 
         public static bool TryGetSavedPositionForSteam(CSteamID steamId, out Vector3 position)

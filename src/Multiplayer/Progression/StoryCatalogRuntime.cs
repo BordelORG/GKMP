@@ -338,10 +338,18 @@ namespace GraveyardKeeperCoop.Multiplayer
 
             int missing = 0;
             int mismatched = 0;
+            int skippedDlc = 0;
             foreach (KeyValuePair<string, StoryCatalogQuest> pair in Quests)
             {
                 QuestDefinition definition =
                     balance.GetDataOrNull<QuestDefinition>(pair.Key);
+                // GKMP: quests from a DLC the player does not own are absent from the
+                // live balance by design; report them once instead of as errors.
+                if (definition == null && IsCatalogFromUnavailableDlc(pair.Value.catalogId))
+                {
+                    skippedDlc++;
+                    continue;
+                }
                 if (definition == null)
                 {
                     missing++;
@@ -355,10 +363,16 @@ namespace GraveyardKeeperCoop.Multiplayer
                     mismatched++;
             }
 
+            if (skippedDlc > 0)
+            {
+                CoopMod.Logger.LogInfo(
+                    $"[StoryCatalog] Skipped {skippedDlc} catalogued quest(s) from DLC that is not installed");
+            }
+
             if (missing == 0 && mismatched == 0)
             {
                 CoopMod.Logger.LogInfo(
-                    $"[StoryCatalog] Validated all {Quests.Count} catalogued " +
+                    $"[StoryCatalog] Validated all {Quests.Count - skippedDlc} applicable catalogued " +
                     "QuestDefinition records against the live game balance");
                 return;
             }
@@ -366,6 +380,23 @@ namespace GraveyardKeeperCoop.Multiplayer
             CoopMod.Logger.LogError(
                 $"[StoryCatalog] Live definition audit failed: total={Quests.Count}, " +
                 $"missing={missing}, mismatched={mismatched}");
+        }
+
+        private static bool IsCatalogFromUnavailableDlc(string catalogId)
+        {
+            if (string.IsNullOrEmpty(catalogId) || !catalogId.StartsWith("dlc.", StringComparison.Ordinal))
+                return false;
+            DLCEngine.DLCVersion dlc;
+            if (catalogId.StartsWith("dlc.better-save-soul.", StringComparison.Ordinal))
+                dlc = DLCEngine.DLCVersion.Souls;
+            else if (catalogId.StartsWith("dlc.game-of-crone.", StringComparison.Ordinal))
+                dlc = DLCEngine.DLCVersion.Refugees;
+            else if (catalogId.StartsWith("dlc.stranger-sins.", StringComparison.Ordinal))
+                dlc = DLCEngine.DLCVersion.Stories;
+            else
+                return false;
+            try { return !DLCEngine.IsDLCAvailable(dlc); }
+            catch { return false; }
         }
 
         public static void ObserveQuestStarted(QuestDefinition definition, bool remote)
