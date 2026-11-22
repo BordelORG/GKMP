@@ -32,6 +32,7 @@ namespace GraveyardKeeperCoop.Multiplayer
         private const byte SleepMessageSnapshot = 1;
         private const byte SleepMessageWakeAll = 2;
         private const byte SleepMessageWakeComplete = 3;
+        private const byte SleepMessageWakeRequest = 4;
         private const byte SleepRosterTailVersion = 1;
         private const int MaxSleepRosterMembers = 4;
         private const int MaxCatchUpDaysPerPacket = 14;
@@ -263,6 +264,15 @@ namespace GraveyardKeeperCoop.Multiplayer
                     return false;
                 }
 
+                // GKMP: while the whole party is asleep, pressing E ends the night for
+                // everyone (synchronized wake) instead of leaving the others alone in bed.
+                if (fastForwardAuthorized)
+                {
+                    CoopMod.Logger.LogInfo("[SleepSync] Manual wake while the whole party sleeps; waking everyone");
+                    RequestPartyWake();
+                    return false;
+                }
+
                 CoopMod.Logger.LogInfo("[SleepSync] Local player left bed manually");
                 suppressNextSynchronizedWakeSpeech = false;
                 suppressNextSynchronizedFirstSleepStory = false;
@@ -395,6 +405,16 @@ namespace GraveyardKeeperCoop.Multiplayer
             try
             {
                 byte messageType = reader.ReadByte();
+                if (messageType == SleepMessageWakeRequest)
+                {
+                    if (IsHost && OnlineCoopManager.Instance?.IsRemotePlayer(senderID) == true)
+                    {
+                        CoopMod.Logger.LogInfo($"[SleepSync] {senderID} asked to wake the party");
+                        RequestPartyWake();
+                    }
+                    return;
+                }
+
                 if (messageType == SleepMessageState)
                 {
                     if (!IsHost || reader.Remaining < 2 ||
@@ -571,6 +591,33 @@ namespace GraveyardKeeperCoop.Multiplayer
                 TryReleaseWakeCompletionBarrier(
                     "remaining wake-transition peers disconnected");
             }
+        }
+
+        private bool partyWakeRequested;
+
+        /// <summary>
+        /// GKMP: manual wake (E / back) while every player sleeps. The host runs the normal
+        /// synchronized party wake; a client asks the host to. Ignored unless the whole party
+        /// is asleep, so a lone sleeper still just gets up.
+        /// </summary>
+        private void RequestPartyWake()
+        {
+            if (!IsHost)
+            {
+                if (partyWakeRequested)
+                    return;
+                partyWakeRequested = true;
+                using (var writer = new MsgWriter(Op.SleepSync, 1))
+                {
+                    writer.Write(SleepMessageWakeRequest);
+                    SteamP2PManager.Instance?.SendToHost(writer.ToArray());
+                }
+                return;
+            }
+
+            if (!fastForwardAuthorized || !TryGetLobbyMembers(out HashSet<ulong> members))
+                return;
+            HostWakeEveryone(members);
         }
 
         private void SubmitLocalSleepState()
@@ -1735,6 +1782,7 @@ namespace GraveyardKeeperCoop.Multiplayer
 
         private void ApplySynchronizedWake()
         {
+            partyWakeRequested = false;
             suppressNextSynchronizedFirstSleepStory =
                 !IsHost && IsFirstSleepStoryWakeGateActive();
             fastForwardAuthorized = false;

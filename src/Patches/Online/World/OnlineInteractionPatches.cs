@@ -462,6 +462,20 @@ namespace GraveyardKeeperCoop.Patches
             ref GJCommons.VoidDelegate on_wake_up,
             ref GJCommons.VoidDelegate on_after_save)
         {
+            // GKMP: vanilla refuses to open the sleep screen at full energy and sanity. In
+            // online coop a rested player must still be able to lie down next to a tired
+            // partner, otherwise the night can never pass. Shave a hair off energy so the
+            // vanilla check lets them in; they count as rested at once and wait for the party.
+            WorldGameObject player = MainGame.me?.player;
+            if (player != null && OnlineCoopManager.Instance?.IsOnlineCoopEnabled == true &&
+                !(GUIElements.me?.sleep_gui?.is_shown ?? false) &&
+                player.energy.EqualsTo(MainGame.me.save.max_energy) &&
+                player.sanity.EqualsTo(MainGame.me.save.max_sanity))
+            {
+                player.energy = MainGame.me.save.max_energy - 0.5f;
+                CoopMod.Logger.LogInfo("[SleepSync] Rested player lies down to sleep with the party");
+            }
+
             GJCommons.VoidDelegate originalAppeared = on_appeared;
             on_appeared = delegate
             {
