@@ -34,13 +34,16 @@ namespace GraveyardKeeperCoop.Multiplayer
             {
                 if (quests.IsQuestSucced(questIds[i]))
                 {
-                    bool hasPersonalRewardSource =
-                        StoryCatalogRuntime.GetPersonalRewardSource(
-                            questIds[i]) != null;
                     ApplySucceededQuestParameterRepair(questIds[i]);
+                    // GKMP: catch-up (late join / profile restore) only ensures the
+                    // player owns the reward. A joiner's loaded inventory is the host's
+                    // copy, which already holds the host's reward (e.g. the prologue
+                    // tools on the toolbelt); stacking a full allocation on top filled
+                    // the joiner's bag with duplicates. Live completions still grant the
+                    // full observer allocation (OnRemoteQuestSucceeded).
                     ApplySucceededQuestPersonalItemGrants(
                         questIds[i],
-                        hasPersonalRewardSource);
+                        false);
                     ReconcilePersonalRewardSourceContainer(questIds[i]);
                     ApplySucceededQuestGlobalScripts(questIds[i]);
                 }
@@ -751,6 +754,21 @@ namespace GraveyardKeeperCoop.Multiplayer
                 grantFullObserverAllocation);
         }
 
+        /// <summary>Bag (with nested bags) plus toolbelt: tools live on the toolbelt.</summary>
+        private static int CountOwned(Item data, string itemId)
+        {
+            int count = data.GetTotalCount(itemId, true);
+            if (data.secondary_inventory != null)
+            {
+                foreach (Item item in data.secondary_inventory)
+                {
+                    if (item != null && item.id == itemId)
+                        count += item.value;
+                }
+            }
+            return count;
+        }
+
         private static void ApplyPersonalItemGrants(
             StoryCatalogPersonalItemGrant[] grants,
             string source,
@@ -772,7 +790,7 @@ namespace GraveyardKeeperCoop.Multiplayer
                     continue;
                 }
 
-                int current = player.data.GetTotalCount(grant.itemId, true);
+                int current = CountOwned(player.data, grant.itemId);
                 bool hasReceipt =
                     player.data.GetParam(grant.receiptId, 0f) >= 0.5f;
                 if (hasReceipt)
@@ -785,7 +803,7 @@ namespace GraveyardKeeperCoop.Multiplayer
                 if (missing > 0)
                 {
                     player.AddToInventory(grant.itemId, missing);
-                    current = player.data.GetTotalCount(grant.itemId, true);
+                    current = CountOwned(player.data, grant.itemId);
                 }
 
                 if (current < required)
