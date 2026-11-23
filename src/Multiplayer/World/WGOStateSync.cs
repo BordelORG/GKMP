@@ -725,8 +725,38 @@ namespace GraveyardKeeperCoop.Multiplayer
             return true;
         }
 
+        // GKMP: objects whose identity just changed through a direct event (tree -> stump,
+        // destroyed, killed). A world snapshot is captured and applied over several frames,
+        // so it can still carry the state from before that event and would revive the
+        // object. Snapshot entries for these ids are skipped for a short window; the next
+        // snapshot carries the settled state.
+        private static readonly Dictionary<long, float> recentIdentityChanges = new Dictionary<long, float>();
+        private const float IdentityChangeShieldSeconds = 5f;
+
+        internal static void NoteIdentityChange(long uniqueId)
+        {
+            if (uniqueId <= 0L || IsProcessingRemote)
+                return;
+            recentIdentityChanges[uniqueId] = Time.realtimeSinceStartup;
+        }
+
+        private static bool IsShieldedFromSnapshot(long uniqueId)
+        {
+            if (uniqueId <= 0L || !recentIdentityChanges.TryGetValue(uniqueId, out float at))
+                return false;
+            if (Time.realtimeSinceStartup - at <= IdentityChangeShieldSeconds)
+                return true;
+            recentIdentityChanges.Remove(uniqueId);
+            return false;
+        }
+
         private static void ApplyEntry(WgoStateEntry entry)
         {
+            if (IsShieldedFromSnapshot(entry.UniqueId))
+            {
+                CoopMod.Logger.LogInfo($"[WGOStateSync] Skipped snapshot entry for {entry.ObjId}#{entry.UniqueId}: it changed through a direct event moments ago");
+                return;
+            }
             SerializableWGO serialized = JsonUtility.FromJson<SerializableWGO>(entry.WgoJson);
             if (string.IsNullOrEmpty(serialized.obj_id) || serialized.obj_id == "0")
             {

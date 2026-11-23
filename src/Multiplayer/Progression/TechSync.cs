@@ -455,10 +455,61 @@ namespace GraveyardKeeperCoop.Multiplayer
             CoopMod.Logger.LogInfo($"{LogPrefix} Broadcast craft unlock event: {craftId}");
         }
 
+        // GKMP: a local tech purchase not yet echoed back in a host snapshot. A snapshot the
+        // host built before it received our unlock would otherwise un-learn it for a moment
+        // (visible with real network latency).
+        private string pendingLocalTechId;
+        private float pendingLocalTechAt;
+        private List<string>[] pendingLocalLists;
+        private List<int> pendingLocalBranches;
+        private const float PendingLocalTechTimeout = 15f;
+
+        private void RememberPendingLocalTech(string techId)
+        {
+            var save = MainGame.me?.save;
+            if (save == null) return;
+            pendingLocalTechId = techId;
+            pendingLocalTechAt = UnityEngine.Time.realtimeSinceStartup;
+            pendingLocalLists = new[]
+            {
+                new List<string>(save.unlocked_techs), new List<string>(save.unlocked_crafts),
+                new List<string>(save.unlocked_works), new List<string>(save.unlocked_phrases),
+                new List<string>(save.unlocked_perks), new List<string>(save.revealed_techs),
+                new List<string>(save.visible_techs)
+            };
+            pendingLocalBranches = new List<int>(save.unlocked_tech_branches);
+        }
+
+        private void KeepPendingLocalTech(GameSave save)
+        {
+            if (pendingLocalTechId == null) return;
+            if (save.unlocked_techs.Contains(pendingLocalTechId) ||
+                UnityEngine.Time.realtimeSinceStartup - pendingLocalTechAt > PendingLocalTechTimeout)
+            {
+                pendingLocalTechId = null;   // the host confirmed it (or never will)
+                pendingLocalLists = null;
+                pendingLocalBranches = null;
+                return;
+            }
+            var targets = new[]
+            {
+                save.unlocked_techs, save.unlocked_crafts, save.unlocked_works, save.unlocked_phrases,
+                save.unlocked_perks, save.revealed_techs, save.visible_techs
+            };
+            for (int i = 0; i < targets.Length; i++)
+                foreach (var id in pendingLocalLists[i])
+                    if (!targets[i].Contains(id)) targets[i].Add(id);
+            foreach (var b in pendingLocalBranches)
+                if (!save.unlocked_tech_branches.Contains(b)) save.unlocked_tech_branches.Add(b);
+            save.locked_crafts.RemoveAll(c => save.unlocked_crafts.Contains(c));
+            CoopMod.Logger.LogInfo($"{LogPrefix} Kept local unlock '{pendingLocalTechId}' over an older host snapshot");
+        }
+
         internal void BroadcastTechUnlock(string techId)
         {
             if (applyingUnlockEvent || !IsSyncEnabled || !IsOnline || string.IsNullOrEmpty(techId))
                 return;
+            RememberPendingLocalTech(techId);
 
             SteamP2PManager.Instance?.BroadcastTechSyncUnlock(
                 Encoding.UTF8.GetBytes(TechUnlockPrefix + techId));
@@ -503,6 +554,7 @@ namespace GraveyardKeeperCoop.Multiplayer
 
                 var blackList = ReadStringList(reader);
                 SetGameLogicsBlackList(save.game_logics, blackList);
+                KeepPendingLocalTech(save);
 
                 RefreshTechDependentState();
 
