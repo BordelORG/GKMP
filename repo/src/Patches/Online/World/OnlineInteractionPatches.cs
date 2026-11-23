@@ -514,7 +514,8 @@ namespace GraveyardKeeperCoop.Patches
         public static void SleepUpdate_Prefix()
         {
             GameTimeSync sync = GameTimeSync.Instance;
-            suppressSleepRecovery = sync?.IsLocalSleepWaitingForParty == true;
+            suppressSleepRecovery = sync?.IsLocalSleepWaitingForParty == true ||
+                                    sync?.IsLocalPartyWakeRequested == true;
 
             if (sync?.IsLocalSleeping == true &&
                 LazyInput.GetKeyDown(GameKey.Interaction))

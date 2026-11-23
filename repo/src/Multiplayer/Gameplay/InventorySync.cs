@@ -762,7 +762,15 @@ namespace GraveyardKeeperCoop.Multiplayer
 
             for (int i = 0; i < snapshot.WgoEntries.Count; i++)
             {
-                locallyMutatedWgoKeys.Remove(snapshot.WgoEntries[i].Key);
+                // Only the player's own actions (explicitly marked), not drift from the
+                // local simulation: the host stays authoritative for everything else.
+                bool playerMade = locallyMutatedWgoKeys.Remove(snapshot.WgoEntries[i].Key);
+                if (playerMade && !onlineCoop.IsHost && !snapshot.WgoEntries[i].IsLocalPlayerInventory)
+                {
+                    awaitingEcho[snapshot.WgoEntries[i].Key] = new KeyValuePair<string, float>(
+                        snapshot.WgoEntries[i].Fingerprint,
+                        Time.realtimeSinceStartup + AwaitEchoSeconds);
+                }
             }
 
             lastSentFingerprint = snapshot.Fingerprint;
@@ -835,6 +843,9 @@ namespace GraveyardKeeperCoop.Multiplayer
                     SendLocalSnapshot(force: true);
                     return;
                 }
+
+                if (!onlineCoop.IsHost)
+                    DropEntriesAwaitingEcho(snapshot);
 
                 ApplySnapshot(snapshot);
 
@@ -1484,6 +1495,39 @@ namespace GraveyardKeeperCoop.Multiplayer
             finally
             {
                 isApplyingRemote = false;
+            }
+        }
+
+        // GKMP: a client's own change to an object, sent to the host, could be undone by a
+        // host snapshot that was already on its way (taken before the host saw the change):
+        // a finished grave part vanished until the host's echo arrived, or for good if the
+        // echo was lost in a backlog. Until the host echoes the sent state (or a few seconds
+        // pass), host entries for that object with a different state are not applied.
+        private const float AwaitEchoSeconds = 8f;
+        private readonly Dictionary<string, KeyValuePair<string, float>> awaitingEcho =
+            new Dictionary<string, KeyValuePair<string, float>>();
+
+        private void DropEntriesAwaitingEcho(InventorySnapshot snapshot)
+        {
+            if (awaitingEcho.Count == 0 || snapshot.IsFull)
+            {
+                if (snapshot.IsFull) awaitingEcho.Clear();
+                return;
+            }
+
+            float now = Time.realtimeSinceStartup;
+            for (int i = snapshot.WgoEntries.Count - 1; i >= 0; i--)
+            {
+                InventoryWgoEntry entry = snapshot.WgoEntries[i];
+                if (!awaitingEcho.TryGetValue(entry.Key, out KeyValuePair<string, float> sent))
+                    continue;
+                if (now > sent.Value || entry.Fingerprint == sent.Key)
+                {
+                    awaitingEcho.Remove(entry.Key);
+                    continue;
+                }
+                RxDebug($"Kept the local change of {entry.Key}: the host's state predates it");
+                snapshot.WgoEntries.RemoveAt(i);
             }
         }
 
@@ -2277,6 +2321,10 @@ namespace GraveyardKeeperCoop.Multiplayer
             // replaced, trades changed that detached copy: the stock never ran out and the
             // change was never sent. Drop the cache so it is rebuilt on the new data.
             VendorCacheField?.SetValue(wgo, null);
+            // GKMP: an open chest window holds the data it was opened with; moving an item
+            // there afterwards took it from the detached copy (the item was duplicated and
+            // the move never reached the host). Rebind the window to the new data now.
+            Instance?.RedrawOpenChest(wgo.unique_id);
             try
             {
                 wgo.Redraw(true);

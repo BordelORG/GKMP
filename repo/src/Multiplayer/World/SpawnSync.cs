@@ -588,7 +588,8 @@ namespace GraveyardKeeperCoop.Multiplayer
 
                 pendingHostWgoSpawns.Remove(instanceId);
                 WorldGameObject wgo = pending.Wgo;
-                if (wgo == null || wgo.is_removed || wgo.unique_id <= 0L)
+                if (wgo == null || wgo.is_removed || wgo.unique_id <= 0L ||
+                    IsDungeonGenerated(wgo))
                     continue;
 
                 SendWgoSpawned(wgo);
@@ -720,12 +721,28 @@ namespace GraveyardKeeperCoop.Multiplayer
             }
         }
 
+        private static bool IsDungeonGenerated(WorldGameObject wgo)
+        {
+            try
+            {
+                var root = MainGame.me?.dungeon_root;
+                return root != null && wgo.transform.IsChildOf(root.transform);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
         internal void SendWgoSpawned(WorldGameObject wgo)
         {
             if (!IsSyncEnabled) return;
             if (!IsOnline) return;
             if (!IsHost) return;
             if (wgo == null) return;
+            // GKMP: dungeon rooms are generated on every peer from the shared dungeon seed;
+            // sending their objects as well made each one appear twice for the partner.
+            if (IsDungeonGenerated(wgo)) return;
 
             if (!TrySerializeWgo(wgo, out string json)) return;
             byte[] jsonBytes = Encoding.UTF8.GetBytes(json);

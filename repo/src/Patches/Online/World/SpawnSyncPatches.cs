@@ -1,5 +1,6 @@
 using HarmonyLib;
 using System;
+using System.Collections.Generic;
 using UnityEngine;
 
 namespace GraveyardKeeperCoop.Patches
@@ -24,6 +25,11 @@ namespace GraveyardKeeperCoop.Patches
             public string Fingerprint;
         }
 
+        private static readonly System.Reflection.FieldInfo WorldMapObjsField =
+            AccessTools.Field(typeof(WorldMap), "_objs");
+        private static readonly System.Reflection.FieldInfo WorldMapIdsField =
+            AccessTools.Field(typeof(WorldMap), "_objs_ids");
+
         private static WorldGameObject buildPlacementInProgress;
         private static bool creatingFloatingObject;
 
@@ -36,6 +42,18 @@ namespace GraveyardKeeperCoop.Patches
             __state = false;
             if (wgo == null || wgo.unique_id <= 0L)
                 return;
+
+            // GKMP: WorldMap only checks the id. A restore that gives a listed object a new
+            // id (the host's) listed the same object a second time; the partner then saw
+            // every dungeon object twice. Note the new id so the game does not add it again.
+            try
+            {
+                var objs = WorldMapObjsField?.GetValue(null) as List<WorldGameObject>;
+                var ids = WorldMapIdsField?.GetValue(null) as HashSet<long>;
+                if (objs != null && ids != null && !ids.Contains(wgo.unique_id) && objs.Contains(wgo))
+                    ids.Add(wgo.unique_id);
+            }
+            catch { }
 
             WorldGameObject registered =
                 WorldMap.GetWorldGameObjectByUniqueId(

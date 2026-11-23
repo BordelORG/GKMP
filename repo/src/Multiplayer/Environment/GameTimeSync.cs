@@ -595,6 +595,11 @@ namespace GraveyardKeeperCoop.Multiplayer
 
         private bool partyWakeRequested;
 
+        /// <summary>GKMP: this player pressed the key to get up and the host's wake is on its
+        /// way. Sleep recovery stops meanwhile: a slow network must not turn a short night
+        /// into a full rest.</summary>
+        public bool IsLocalPartyWakeRequested => partyWakeRequested && localSleeping;
+
         /// <summary>
         /// GKMP: manual wake (E / back) while every player sleeps. The host runs the normal
         /// synchronized party wake; a client asks the host to. Ignored unless the whole party
