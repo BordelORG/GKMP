@@ -48,6 +48,7 @@ namespace CoopQA
             new KeyValuePair<string, Func<IEnumerator>>("fishing_client", () => Fishing(2)),
             new KeyValuePair<string, Func<IEnumerator>>("build_host", () => Build(1)),
             new KeyValuePair<string, Func<IEnumerator>>("build_client", () => Build(2)),
+            new KeyValuePair<string, Func<IEnumerator>>("dungeon", Dungeon),
             new KeyValuePair<string, Func<IEnumerator>>("sleep_rested_client", () => Sleep(clientTired: false, wakeWithKey: false)),
             new KeyValuePair<string, Func<IEnumerator>>("sleep_wake_with_key", () => Sleep(clientTired: true, wakeWithKey: true)),
             new KeyValuePair<string, Func<IEnumerator>>("time_after_sleep", Time),
@@ -692,7 +693,21 @@ namespace CoopQA
                 if (surgeonMistake)
                     Bot.Step("info surgeon's mistake: the organ was destroyed (vanilla outcome)");
                 else if (outIds.Count > 0)
+                {
                     Bot.Check("crafted item received (inventory or ground)", got > 0, $"+{got}");
+                    if (got <= 0)
+                    {
+                        // Where did it go? Every drop of it in the world, and every container holding it.
+                        var drops = UnityEngine.Object.FindObjectsOfType<DropResGameObject>()
+                            .Where(d => d != null && d.res != null && outIds.Any(o => d.res.id.StartsWith(o)))
+                            .Select(d => $"{d.res.id}@{V(d.transform.position)} collected={d.is_collected}");
+                        var holders = WorldMap.objs.Where(w => w != null && w.data != null &&
+                                                              w.data.inventory.Any(i => i != null && outIds.Any(o => i.id.StartsWith(o + ":") || i.id == o)))
+                                                   .Select(w => $"{w.obj_id}#{w.unique_id}");
+                        Bot.Step($"info output {string.Join("/", outIds)}: drops [{string.Join(",", drops)}] held by [{string.Join(",", holders.Take(10))}] " +
+                                 $"me at {V(MainGame.me.player.pos)} bag [{Items(MainGame.me.player.data.inventory)}]");
+                    }
+                }
                 Bot.Step($"info station before [{stationBefore}] after [{StationState(station)}] params: {station.data.GetParam("quality", -1f)}");
                 Bot.Publish("craft_changed", StationState(station) != stationBefore || got > 0 ? "1" : "0");
                 Bot.Publish("craft_done", StationState(station));
@@ -1225,6 +1240,84 @@ namespace CoopQA
                 Bot.Step("info client in dungeon: " + DungeonInfo());
                 host = OnlineCoopManager.Instance?.GetRemotePlayer();
                 Bot.Step($"info host proxy at {(host == null ? "none" : V(host.transform.position) + " active=" + host.gameObject.activeInHierarchy)}");
+            }
+        }
+
+
+        private static bool InDungeon() => MainGame.me.dungeon_root != null && MainGame.me.dungeon_root.dungeon_is_loaded_now;
+
+        /// <summary>The dungeon's objects (rooms, furniture, exits), by kind: both peers generate them from one seed.</summary>
+        private static string DungeonObjects()
+        {
+            var root = MainGame.me.dungeon_root;
+            if (root == null || !root.dungeon_is_loaded_now) return "";
+            var all = WorldMap.objs.Where(w => w != null && !w.is_removed && w.obj_id != null && !w.is_player &&
+                                               Vector2.Distance(w.pos, root.enter_to_dunge.transform.position) < 6000f &&
+                                               (w.obj_def == null || !w.obj_def.IsNPC()) && !w.obj_id.StartsWith("bat") && !w.obj_id.StartsWith("slime") &&
+                                               !w.obj_id.StartsWith("skeleton") && !w.obj_id.StartsWith("zombie"));
+            return string.Join(",", all.GroupBy(w => w.obj_id).OrderBy(g => g.Key).Select(g => $"{g.Key}x{g.Count()}"));
+        }
+
+        /// <summary>Why a dungeon object is counted twice: listed twice, or two real objects (where).</summary>
+        private static string DungeonDuplicates()
+        {
+            var root = MainGame.me.dungeon_root;
+            var list = WorldMap.objs.Where(w => w != null && !w.is_removed && w.obj_id == "dungeon_exit").ToList();
+            var distinct = list.Distinct().ToList();
+            return $"dungeon_exit listed {list.Count}, distinct {distinct.Count}: " +
+                   string.Join(" ", distinct.Select(w => $"#{w.unique_id}@{V(w.pos)} active={w.gameObject.activeInHierarchy} " +
+                                                         $"underRoot={w.transform.IsChildOf(root.transform)} parent={w.transform.parent?.name}"));
+        }
+
+        /// <summary>The host goes down into the dungeon; the partner is taken along, gets the same
+        /// level with every object once, both see each other; the host walks out, the partner too.</summary>
+        private static IEnumerator Dungeon()
+        {
+            var me = MainGame.me.player;
+            if (Bot.IsHost)
+            {
+                Bot.Check("not in a dungeon yet", !InDungeon());
+                MainGame.me.TeleportToDungeonLevel(1);   // what the level button at the dungeon entrance does
+                yield return Bot.WaitUntil("in the dungeon", InDungeon, 15f);
+                yield return Bot.Wait(4f);
+                Bot.Publish("dungeon_objs", DungeonObjects());
+                Bot.Publish("dungeon_in", $"{MainGame.me.dungeon_root.cur_dungeon_preset.dungeon_level}|{MainGame.me.save.dungeon_seed}");
+                yield return Bot.WaitRemote(2, "dungeon_checked", "1", 60f);
+                var exit = WorldMap.objs.Where(w => w != null && !w.is_removed && w.obj_id == "dungeon_exit")
+                                        .OrderBy(w => (w.pos - me.pos).sqrMagnitude).FirstOrDefault();
+                Bot.Check("found the dungeon exit", exit != null);
+                if (exit != null)
+                {
+                    yield return WalkUpTo(exit, 120f);
+                    Bot.Step($"info at the exit: nearest={me.components.interaction.nearest?.obj_id}");
+                    yield return FakeInput.Press(GameKey.Interaction);
+                    yield return Bot.WaitUntil("left the dungeon", () => !InDungeon(), 20f);
+                    if (InDungeon()) Bot.Step("info still inside: " + DungeonInfo());
+                }
+                yield return Bot.WaitUntil("can move again", CanMove, 10f);
+                Bot.Publish("dungeon_out", "1");
+                yield return Bot.WaitRemote(2, "dungeon_done", "1", 60f);
+            }
+            else
+            {
+                yield return Bot.WaitUntil("host in the dungeon", () => Bot.Remote(1, "dungeon_in") != null, 60f);
+                var p = Bot.Remote(1, "dungeon_in").Split('|');
+                yield return Bot.WaitUntil("taken along into the dungeon", InDungeon, 20f);
+                yield return Bot.Wait(4f);
+                Bot.Check("same level and seed", InDungeon() && MainGame.me.dungeon_root.cur_dungeon_preset.dungeon_level.ToString() == p[0] &&
+                          MainGame.me.save.dungeon_seed.ToString() == p[1], $"here {MainGame.me.dungeon_root.cur_dungeon_preset?.dungeon_level}|{MainGame.me.save.dungeon_seed}, host {p[0]}|{p[1]}");
+                string mine = DungeonObjects(), host = Bot.Remote(1, "dungeon_objs");
+                Bot.Check("the same dungeon objects, each once", mine == host, $"here [{mine}] host [{host}]");
+                if (mine != host) Bot.Step("info " + DungeonDuplicates());
+                var proxy = OnlineCoopManager.Instance?.GetRemotePlayer();
+                Bot.Check("I see the host in the dungeon", proxy != null && proxy.gameObject.activeInHierarchy &&
+                          Vector2.Distance(proxy.transform.position, me.pos) < 2000f, proxy == null ? "none" : V(proxy.transform.position) + " me " + V(me.pos));
+                Bot.Check("I can move in the dungeon", CanMove());
+                Bot.Publish("dungeon_checked", "1");
+                yield return Bot.WaitUntil("host walked out", () => Bot.Remote(1, "dungeon_out") != null, 60f);
+                yield return Bot.WaitUntil("taken out of the dungeon too", () => !InDungeon(), 20f);
+                yield return Bot.WaitUntil("can move again", CanMove, 10f);
+                Bot.Publish("dungeon_done", "1");
             }
         }
 

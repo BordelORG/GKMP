@@ -25,8 +25,31 @@ namespace CoopQA
                 postfix: new HarmonyMethod(typeof(Diag), nameof(CraftDone)));
             h.Patch(AccessTools.Method(typeof(WorldMap), "OnAddNewWGO"),
                 prefix: new HarmonyMethod(typeof(Diag), nameof(Added)));
+            h.Patch(AccessTools.Method(typeof(WorldMap), "OnAddNewWGO"),
+                postfix: new HarmonyMethod(typeof(Diag), nameof(AddedTwice)));
+            h.Patch(AccessTools.Method(typeof(WorldMap), "OnDestroyWGO"),
+                prefix: new HarmonyMethod(typeof(Diag), nameof(Unlisted)));
             h.Patch(AccessTools.Method(typeof(OnlineCoopManager), "SnapRemotePlayerToNetworkPosition"),
                 prefix: new HarmonyMethod(typeof(Diag), nameof(Snapped)));
+        }
+
+        private static readonly System.Reflection.FieldInfo ObjsF = AccessTools.Field(typeof(WorldMap), "_objs");
+        private static int dupNotes;
+
+        /// <summary>An object listed twice in WorldMap: log who added it (first few times).</summary>
+        private static void AddedTwice(WorldGameObject wgo)
+        {
+            if (wgo == null || dupNotes >= 3) return;
+            var objs = ObjsF.GetValue(null) as List<WorldGameObject>;
+            if (objs == null || objs.Count(o => o == wgo) < 2) return;
+            dupNotes++;
+            Debug.Log($"[CoopQA] DUP {wgo.obj_id}#{wgo.unique_id} listed twice in WorldMap after OnAddNewWGO:\n{System.Environment.StackTrace}");
+        }
+
+        private static void Unlisted(WorldGameObject wgo)
+        {
+            if (wgo == null || wgo.obj_id != "dungeon_exit") return;
+            Debug.Log($"[CoopQA] UNLIST {wgo.obj_id}#{wgo.unique_id}:\n{System.Environment.StackTrace}");
         }
 
         /// <summary>Unique ids of destroyed objects; registering one again is logged with its call stack.</summary>
