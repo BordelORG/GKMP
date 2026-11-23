@@ -40,6 +40,13 @@ namespace CoopQA
             new KeyValuePair<string, Func<IEnumerator>>("progress_after_sleep", Progress),
         };
 
+        /// <summary>Only run when named in a suite filter (they end or need a prepared session).</summary>
+        public static readonly List<KeyValuePair<string, Func<IEnumerator>>> Extra = new List<KeyValuePair<string, Func<IEnumerator>>>
+        {
+            new KeyValuePair<string, Func<IEnumerator>>("session_end", SessionEnd),
+            new KeyValuePair<string, Func<IEnumerator>>("resume_check", ResumeCheck),
+        };
+
         private static int Other => Bot.IsHost ? 2 : 1;
         private static string F(float v) => v.ToString("0.#####", CultureInfo.InvariantCulture);
         private static float PF(string s) => float.Parse(s, CultureInfo.InvariantCulture);
@@ -591,6 +598,134 @@ namespace CoopQA
             }
         }
 
+
+
+        // ------------------------------------------------------------------ saving and the next evening
+        private static string PersistFile(int player) =>
+            System.IO.Path.Combine(System.IO.Directory.GetParent(Plugin.OutDir).FullName, $"persist_P{player}.txt");
+
+        private static string Items(IEnumerable<Item> items) =>
+            string.Join(",", items.Where(i => i != null && !i.IsEmpty()).GroupBy(i => i.id)
+                                  .Select(g => g.Key + "x" + g.Sum(i => i.value)).OrderBy(x => x));
+
+        private static Dictionary<string, string> PersonalState()
+        {
+            var me = MainGame.me.player;
+            return new Dictionary<string, string>
+            {
+                ["bag"] = Items(me.data.inventory),
+                ["toolbelt"] = Items(me.data.secondary_inventory),
+                ["money"] = F(me.data.money),
+                ["pos"] = V(me.pos),
+                ["day"] = MainGame.me.save.day.ToString(),
+            };
+        }
+
+        private static DateTime NewestWrite(string dir, string pattern) =>
+            System.IO.Directory.Exists(dir)
+                ? System.IO.Directory.GetFiles(dir, pattern).Select(System.IO.File.GetLastWriteTimeUtc).DefaultIfEmpty(DateTime.MinValue).Max()
+                : DateTime.MinValue;
+
+        /// <summary>End of an evening: the client picks something up, both go to bed (the game
+        /// saves when the night ends), the bot writes down what was saved, then the host leaves
+        /// with "Save and exit". The client must land back in the main menu.</summary>
+        private static IEnumerator SessionEnd()
+        {
+            var me = MainGame.me.player;
+            if (!Bot.IsHost)
+            {
+                string marker = new[] { "stick", "nails", "flour", "wheat_crop" }
+                    .FirstOrDefault(id => GameBalance.me.GetDataOrNull<ItemDefinition>(id) != null);
+                me.data.AddItem(marker, 3);   // stands in for something found that evening
+                me.data.money += 1.25f;
+                Bot.Step($"info picked up {marker}x3 and 1.25 money");
+            }
+            string profileDir = BepInEx.Paths.ConfigPath;
+            string saveDir = UnityEngine.Application.persistentDataPath;
+            DateTime profileBefore = NewestWrite(profileDir, "gkcoop_joiner_inventory_*");
+            DateTime saveBefore = NewestWrite(saveDir, "*.dat");
+            yield return Sleep(clientTired: true, wakeWithKey: false);
+            if (Bot.IsHost)
+                yield return Bot.WaitUntil("host save written after the night", () => NewestWrite(saveDir, "*.dat") > saveBefore, 30f);
+            else
+                yield return Bot.WaitUntil("joiner profile committed with the host save", () => NewestWrite(profileDir, "gkcoop_joiner_inventory_*") > profileBefore, 30f);
+
+            var state = PersonalState();
+            if (Bot.IsHost)
+                foreach (var uid in Diag.Destroyed)
+                    state["obj" + uid] = WorldMap.GetWorldGameObjectByUniqueId(uid, false)?.obj_id ?? "none";
+            System.IO.File.WriteAllLines(PersistFile(Plugin.Player), state.Select(kv => kv.Key + "=" + kv.Value).ToArray());
+            Bot.Step("info saved state: " + string.Join(" ", state.Select(kv => kv.Key + "=" + kv.Value)));
+            yield return Bot.Sync("state_written");
+
+            if (Bot.IsHost)
+            {
+                yield return Bot.Wait(1f);
+                Bot.Step("info host: Save and exit -> Yes");
+                GUIElements.me.ingame_menu.ReturnToMainMenu();   // what the dialog's Yes does
+                yield return Bot.WaitUntil("host back in the main menu", () => GUIElements.me.main_menu.is_shown, 30f);
+            }
+            else
+            {
+                var dialog = GUIElements.me.dialog;
+                yield return Bot.WaitUntil("client is told the host left", () => dialog.is_shown, 30f);
+                string text = dialog.label_1?.text ?? "";
+                Bot.Check("message says the host left", text.ToLowerInvariant().Contains("host"), $"'{text}'");
+                yield return Bot.Wait(1f);
+                // Click OK, like the player.
+                var buttons = HarmonyLib.AccessTools.Field(typeof(DialogGUI), "_dialog_buttons").GetValue(dialog);
+                var delegates = (System.Collections.IList)HarmonyLib.AccessTools.Field(buttons.GetType(), "_delegates").GetValue(buttons);
+                ((GJCommons.VoidDelegate)delegates[0]).Invoke();
+                yield return Bot.WaitUntil("client back in the main menu after OK",
+                    () => GUIElements.me.main_menu.is_shown && !MainGame.game_started && !LoadingGUI.is_shown, 60f);
+                Bot.Check("no window left open", BaseGUI.opened_windows.Count == 0 || BaseGUI.opened_windows.All(w => w == GUIElements.me.main_menu),
+                          string.Join(",", BaseGUI.opened_windows.Select(w => w.GetType().Name)));
+            }
+        }
+
+        private static Dictionary<string, string> ReadState(int player)
+        {
+            var f = PersistFile(player);
+            if (!System.IO.File.Exists(f)) return null;
+            return System.IO.File.ReadAllLines(f).Where(l => l.Contains("="))
+                .ToDictionary(l => l.Substring(0, l.IndexOf('=')), l => l.Substring(l.IndexOf('=') + 1));
+        }
+
+        /// <summary>The next evening (run with --keep): the host loads the saved coop game, the
+        /// friend joins, and everything written down at the end of the last evening is back.</summary>
+        private static IEnumerator ResumeCheck()
+        {
+            var was = ReadState(Plugin.Player);
+            Bot.Check("state from the last evening exists", was != null, PersistFile(Plugin.Player));
+            if (was == null) yield break;
+            var now = PersonalState();
+            Bot.Step("info now: " + string.Join(" ", now.Select(kv => kv.Key + "=" + kv.Value)));
+            Bot.Check("same day as saved", now["day"] == was["day"], $"{now["day"]} vs {was["day"]}");
+            if (!Bot.IsHost)
+            {
+                Bot.Check("bag restored", now["bag"] == was["bag"], $"now [{now["bag"]}] saved [{was["bag"]}]");
+                Bot.Check("toolbelt restored", now["toolbelt"] == was["toolbelt"], $"now [{now["toolbelt"]}] saved [{was["toolbelt"]}]");
+                Bot.Check("money restored", Mathf.Abs(PF(now["money"]) - PF(was["money"])) < 0.01f, $"{now["money"]} vs {was["money"]}");
+            }
+            float moved = Vector2.Distance(ParseV(now["pos"]), ParseV(was["pos"])) / 96f;
+            Bot.Check("starts where the last evening ended (within 3 tiles)", moved < 3f, $"{moved:F1} tiles away");
+            if (Bot.IsHost)
+                foreach (var kv in was.Where(k => k.Key.StartsWith("obj")))
+                {
+                    long uid = long.Parse(kv.Key.Substring(3));
+                    string here = WorldMap.GetWorldGameObjectByUniqueId(uid, false)?.obj_id ?? "none";
+                    Bot.Check($"world object #{uid} as saved", here == kv.Value, $"{here} vs {kv.Value}");
+                }
+            string mine = MyWorld();
+            Bot.Publish("resume_world", mine);
+            yield return Bot.WaitUntil("other side reported its world", () => Bot.Remote(Other, "resume_world") != null, 30f);
+            Bot.Check("both sides load the same stumps", Bot.Remote(Other, "resume_world") == mine,
+                      $"here [{mine}] there [{Bot.Remote(Other, "resume_world")}]");
+        }
+
+        private static string MyWorld() =>
+            string.Join(";", WorldMap.objs.Where(w => w != null && w.unique_id > 0 && w.obj_id != null && w.obj_id.Contains("stump"))
+                                          .Select(w => w.unique_id + ":" + w.obj_id).OrderBy(x => x).Take(50));
 
         // ------------------------------------------------------------------ gathering and combat
         private static readonly System.Reflection.MethodInfo OnChangeDirM =

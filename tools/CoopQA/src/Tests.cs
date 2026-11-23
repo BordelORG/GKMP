@@ -26,7 +26,7 @@ namespace CoopQA
                 case "suite": return Suite(null);
                 default:
                     // suite:a,b,c runs only the listed sync tests (after joining)
-                    if (name.StartsWith("suite:")) return Suite(new HashSet<string>(name.Substring(6).Split(',')));
+                    if (name.StartsWith("suite:")) return Suite(name.Substring(6).Split(',').ToList());
                     return null;
             }
         }
@@ -105,19 +105,24 @@ namespace CoopQA
         {
             foreach (var gui in BaseGUI.opened_windows.ToList())
             {
-                if (gui == null || gui == GUIElements.me.sleep_gui) continue;
+                if (gui == null || gui == GUIElements.me.sleep_gui || gui == GUIElements.me.main_menu) continue;
                 try { gui.Hide(); Bot.Step("     closed leftover window " + gui.GetType().Name); }
                 catch (System.Exception e) { Bot.Step($"     could not close {gui.GetType().Name}: {e.Message}"); }
             }
         }
 
-        private static IEnumerator Suite(HashSet<string> only)
+        private static IEnumerator Suite(List<string> only)
         {
             yield return Join(holdSeconds: 5f);
             Bot.HardWaits = false;
-            foreach (var t in SyncTests.All)
+            var known = SyncTests.All.Concat(SyncTests.Extra).ToList();
+            // A filter runs the named tests in the order given; no filter runs All in order.
+            var run = only == null ? SyncTests.All
+                                   : only.Select(n => known.FirstOrDefault(k => k.Key == n)).Where(k => k.Key != null).ToList();
+            foreach (var n in only ?? new List<string>())
+                if (!known.Any(k => k.Key == n)) Bot.Step("FAIL unknown test " + n);
+            foreach (var t in run)
             {
-                if (only != null && !only.Contains(t.Key)) continue;
                 Bot.Step("---- " + t.Key);
                 Bot.Scope = t.Key;
                 yield return Bot.Sync("begin:" + t.Key);

@@ -33,7 +33,7 @@ def real_saves_dir():
     return None
 
 
-def prepare(player, fixture_src, fixture_name, with_mod=True):
+def prepare(player, fixture_src, fixture_name, with_mod=True, keep=False):
     d = QA / f"P{player}"
     if not (d / "Graveyard Keeper.x86_64").exists():
         subprocess.run([str(ROOT / "tools/qa-make-copies.sh"), f"P{player}"], check=True)
@@ -45,6 +45,14 @@ def prepare(player, fixture_src, fixture_name, with_mod=True):
     if with_mod:
         shutil.copy2(MOD_DLL, plugins)
     saves = d / SAVE_SUBDIR
+    if keep:
+        # The next evening: keep the saves and the joiner profiles from the last run.
+        for f in ("BepInEx/LogOutput.log", "player.log"):
+            (d / f).unlink(missing_ok=True)
+        real_cfg = GAME / "BepInEx/config/com.zlord.graveyardkeeper.coop.cfg"
+        if real_cfg.exists():
+            shutil.copy2(real_cfg, d / "BepInEx/config" / real_cfg.name)
+        return d
     if saves.exists():
         for f in saves.iterdir():
             if f.is_file() and f.name not in ("prefs",):
@@ -149,6 +157,7 @@ def main():
     ap.add_argument("--stagger", type=float, default=3.0)
     ap.add_argument("--port", type=int, default=27800)
     ap.add_argument("--save", default="coop_1")
+    ap.add_argument("--keep", action="store_true", help="keep saves and joiner profiles from the last run (next evening)")
     ap.add_argument("--workspace", default="2", help="Hyprland workspace for the test windows")
     a = ap.parse_args()
 
@@ -182,8 +191,8 @@ def main():
         print("->", out)
         return
     out.mkdir(parents=True)
-    d1 = prepare(1, fixture, a.save)
-    d2 = prepare(2, None, a.save)
+    d1 = prepare(1, fixture, a.save, keep=a.keep)
+    d2 = prepare(2, None, a.save, keep=a.keep)
 
     procs = []
     broker = subprocess.Popen([sys.executable, "-I", str(ROOT / "tools/CoopQA/broker.py"), "--port", str(a.port),
