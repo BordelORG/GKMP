@@ -13,16 +13,37 @@ GKMP is a fork of [GYK Back From The Grave](https://github.com/ZlordHUN/GYK-Back
 - Both players: Steam, BepInEx 5 and the **same build** of `GraveyardKeeperCoop.dll`.
 - Cross-platform play works (Windows and native Linux).
 
+## Download
+
+Ready-to-use packages (BepInEx included) are on the
+[Releases page](https://github.com/BordelORG/GKMP/releases/latest):
+
+- `GKMP-<version>-Windows.zip`
+- `GKMP-<version>-Linux.tar.gz` (native Linux build of the game)
+
+Each package contains an `INSTALL.txt` with the steps below.
+
 ## Installation
 
 ### Windows
 
-1. Build the mod (see below).
-2. Extract BepInEx 5 (x64) into the game folder (next to `Graveyard Keeper.exe`) and copy
-   the DLL to `BepInEx/plugins/GraveyardKeeperCoop/GraveyardKeeperCoop.dll`.
-3. Start the game from Steam as usual.
+1. Back up your saves (`%USERPROFILE%\AppData\LocalLow\Lazy Bear Games\Graveyard Keeper\`).
+2. In Steam: Graveyard Keeper → Manage → Browse local files.
+3. Copy everything from the Windows package into that folder, next to `Graveyard Keeper.exe`.
+4. Start the game from Steam. The main menu now has **Multiplayer**.
 
 ### Linux (native build)
+
+1. Back up your saves (`~/.config/unity3d/Lazy Bear Games/Graveyard Keeper/`).
+2. Extract the Linux package into the game folder, next to `Graveyard Keeper.x86_64`.
+3. In Steam, set the game's launch options to
+   ```
+   "<game folder>/gkmp_launch.sh" %command%
+   ```
+   The stock `run_bepinex.sh` fails inside the Steam Linux Runtime when the game path
+   contains spaces; `gkmp_launch.sh` handles that.
+
+### Linux from source
 
 1. Download [BepInEx 5.4.23.3 for Linux x64](https://github.com/BepInEx/BepInEx/releases/tag/v5.4.23.3)
    and extract it into `deps/bepinex/`.
@@ -30,12 +51,7 @@ GKMP is a fork of [GYK Back From The Grave](https://github.com/ZlordHUN/GYK-Back
    ```bash
    tools/install-linux.sh            # set GRAVEYARD_KEEPER_PATH if the game is elsewhere
    ```
-3. In Steam, set the game's launch options to the line the script prints:
-   ```
-   "<game folder>/gkmp_launch.sh" %command%
-   ```
-   The stock `run_bepinex.sh` fails inside the Steam Linux Runtime when the game path
-   contains spaces.
+3. In Steam, set the game's launch options to the line the script prints.
 
 `tools/install-linux.sh --uninstall` removes everything the script added. Saves are not touched.
 
@@ -71,6 +87,7 @@ GRAVEYARD_KEEPER_PATH="/path/to/Graveyard Keeper" \
 | `tools/CoopQA` | Automated two-player test. Runs host and client as two local game copies with Steam mocked: `python3 tools/CoopQA/run_qa.py suite`, optionally `--lag MS --drop RATE`. |
 | `tools/PatchCheck` | Checks that every Harmony patch target exists in the installed game version. |
 | `tools/install-linux.sh`, `tools/linux-launch` | Linux installation and Steam launch wrapper. |
+| `tools/package.sh <version>` | Builds the Windows and Linux release packages into `dist/` (needs BepInEx in `deps/bepinex` and `deps/bepinex-win`). |
 
 ## License
 
