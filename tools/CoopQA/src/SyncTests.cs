@@ -36,6 +36,12 @@ namespace CoopQA
             new KeyValuePair<string, Func<IEnumerator>>("combat_host", () => Combat(fighter: 1)),
             new KeyValuePair<string, Func<IEnumerator>>("npc_talk_host", () => NpcTalk(talker: 1)),
             new KeyValuePair<string, Func<IEnumerator>>("npc_talk_client", () => NpcTalk(talker: 2)),
+            // Take an organ out of the body on the table: the host the heart, the client the brain.
+            new KeyValuePair<string, Func<IEnumerator>>("autopsy_host", () => Craft(1, w => w.is_autopsy_table, c => c.id.EndsWith(":heart"), StartAutopsy)),
+            new KeyValuePair<string, Func<IEnumerator>>("autopsy_client", () => Craft(2, w => w.is_autopsy_table, c => c.id.EndsWith(":brain"), StartAutopsy)),
+            // Replace a grave's wooden fence with a stone one (host) / another stone one (client).
+            new KeyValuePair<string, Func<IEnumerator>>("grave_host", () => Craft(1, IsGrave, c => c.id == "set_grave_bot_stn_1", StartGravePart)),
+            new KeyValuePair<string, Func<IEnumerator>>("grave_client", () => Craft(2, IsGrave, c => c.id == "set_grave_bot_stn_2", StartGravePart)),
             new KeyValuePair<string, Func<IEnumerator>>("sleep_rested_client", () => Sleep(clientTired: false, wakeWithKey: false)),
             new KeyValuePair<string, Func<IEnumerator>>("sleep_wake_with_key", () => Sleep(clientTired: true, wakeWithKey: true)),
             new KeyValuePair<string, Func<IEnumerator>>("time_after_sleep", Time),
@@ -47,6 +53,7 @@ namespace CoopQA
         {
             new KeyValuePair<string, Func<IEnumerator>>("session_end", SessionEnd),
             new KeyValuePair<string, Func<IEnumerator>>("resume_check", ResumeCheck),
+            new KeyValuePair<string, Func<IEnumerator>>("morgue_probe", MorgueProbe),
         };
 
         private static int Other => Bot.IsHost ? 2 : 1;
@@ -491,20 +498,79 @@ namespace CoopQA
         private static bool HasNeeds(CraftDefinition c) =>
             c.needs != null && c.needs.All(n => n != null && MainGame.me.player.data.GetTotalCount(n.id, true) >= Math.Max(1, n.value));
 
-        private static IEnumerator Craft(int crafter)
+        /// <summary>Contents of a station including what is inside its items (a body's organs).</summary>
+        private static string StationState(WorldGameObject w) =>
+            w?.data == null ? "none" :
+            ParamsOf(w.data) + " " +
+            string.Join(";", w.data.inventory.Where(i => i != null && !i.IsEmpty())
+                              .Select(i => i.id + "x" + i.value + ParamsOf(i) + (i.inventory != null && i.inventory.Count > 0 ? "[" + Items(i.inventory) + "]" : ""))
+                              .OrderBy(x => x));
+
+        private static readonly System.Reflection.FieldInfo ParamsF = HarmonyLib.AccessTools.Field(typeof(Item), "_params");
+        private static readonly System.Reflection.FieldInfo ResTypeF = HarmonyLib.AccessTools.Field(typeof(GameRes), "_res_type");
+
+        /// <summary>An item's params (quality, skulls, ...) sorted by key, as "{k=v,...}".</summary>
+        private static string ParamsOf(Item i)
+        {
+            var res = ParamsF.GetValue(i) as GameRes;
+            var keys = res == null ? null : ResTypeF.GetValue(res) as List<string>;
+            if (keys == null || keys.Count == 0) return "";
+            // A zero param equals a missing one (the game prunes zeros on some writes).
+            var set = keys.Distinct().Where(k => Mathf.Abs(res.Get(k)) > 0.0001f).OrderBy(k => k).ToList();
+            return set.Count == 0 ? "" : "{" + string.Join(",", set.Select(k => k + "=" + F(res.Get(k)))) + "}";
+        }
+
+        private static IEnumerator Craft(int crafter) => Craft(crafter, null, null);
+
+        private static IEnumerator Craft(int crafter, Func<WorldGameObject, bool> stationFilter, Func<CraftDefinition, bool> craftFilter) =>
+            Craft(crafter, stationFilter, craftFilter, null);
+
+        /// <summary>What AutopsyGUI does on a click: take the organ out of the body, then craft with it.</summary>
+        private static bool StartAutopsy(WorldGameObject table, CraftDefinition craft)
+        {
+            string organ = craft.id.Substring(craft.id.LastIndexOf(':') + 1);
+            var body = table.data.inventory.FirstOrDefault(i => i != null && i.id == "body");
+            Item part = null;
+            if (body != null)
+                foreach (var i in body.inventory)
+                {
+                    if (i == null) continue;
+                    if (i.id == organ || i.id.StartsWith(organ + ":")) { part = i; break; }
+                }
+            if (part == null) { Bot.Step($"info no {organ} in the body"); return false; }
+            HarmonyLib.AccessTools.Method(typeof(AutopsyGUI), "RemoveBodyPartFromBody").Invoke(null, new object[] { body, part });
+            return table.components.craft.CraftAsPlayer(craft, part);
+        }
+
+        /// <summary>What GraveGUI does after picking a part: craft with that item from the bag.</summary>
+        private static bool StartGravePart(WorldGameObject grave, CraftDefinition craft)
+        {
+            var me = MainGame.me.player;
+            var part = me.data.inventory.FirstOrDefault(i => i != null && craft.needs.Any(n => n.id == i.id));
+            return grave.components.craft.CraftAsPlayer(craft, part);
+        }
+
+        private static bool IsGrave(WorldGameObject w) =>
+            w.obj_def?.interaction_type == ObjectDefinition.InteractionType.Grave &&
+            w.data.inventory.Any(i => i != null && i.id != null && i.id.StartsWith("grave_bot_wd"));
+
+        private static IEnumerator Craft(int crafter, Func<WorldGameObject, bool> stationFilter, Func<CraftDefinition, bool> craftFilter,
+                                         Func<WorldGameObject, CraftDefinition, bool> start)
         {
             if (Plugin.Player == crafter)
             {
                 var me = MainGame.me.player;
                 var candidates = WorldMap.objs
                     .Where(w => w != null && w.components?.craft != null && w.unique_id > 0 && !w.is_player &&
-                                !w.components.craft.is_crafting && w.components.craft.crafts != null)
+                                !w.components.craft.is_crafting && w.components.craft.crafts != null &&
+                                (stationFilter == null || stationFilter(w)))
                     .OrderBy(w => (w.pos - me.pos).sqrMagnitude).Take(40).ToList();
+                Func<CraftDefinition, bool> wanted = c => craftFilter != null ? craftFilter(c) : c.needs.Count > 0 && !c.id.Contains("remove");
                 WorldGameObject station = null; CraftDefinition craft = null;
                 foreach (var w in candidates)
                 {
-                    craft = w.components.craft.crafts.FirstOrDefault(c => c != null && !c.is_auto && c.needs.Count > 0 && c.output.Count > 0 &&
-                                                                         !c.id.Contains("remove") && HasNeeds(c));
+                    craft = w.components.craft.crafts.FirstOrDefault(c => c != null && !c.is_auto && (c.output.Count > 0 || craftFilter != null) &&
+                                                                         wanted(c) && HasNeeds(c));
                     if (craft != null) { station = w; break; }
                 }
                 if (station == null)
@@ -514,7 +580,7 @@ namespace CoopQA
                     foreach (var w in candidates.Where(w => w.components.craft.crafts.Count > 0))
                     {
                         craft = w.components.craft.crafts
-                            .Where(c => c != null && !c.is_auto && c.needs.Count > 0 && c.output.Count > 0 && !c.id.Contains("remove") &&
+                            .Where(c => c != null && !c.is_auto && (c.output.Count > 0 || craftFilter != null) && wanted(c) &&
                                         c.needs.All(n => n != null && GameBalance.me.GetDataOrNull<ItemDefinition>(n.id) != null))
                             .OrderBy(c => c.needs.Count).FirstOrDefault();
                         if (craft == null) continue;
@@ -535,11 +601,14 @@ namespace CoopQA
                 string needs = string.Join(",", craft.needs.Select(n => n.id + "x" + n.value));
                 string outputs = string.Join(",", craft.output.Select(o => o.id + "x" + o.value));
                 Bot.Step($"info crafting '{craft.id}' at {station.obj_id}#{station.unique_id}: needs {needs} -> {outputs}");
-                var outIds = craft.output.Select(o => o.id).ToList();
-                Func<int> haveOut = () => outIds.Sum(id => me.data.GetTotalCount(id, true));
+                var outIds = craft.output.Select(o => o.id).Where(id => id.Length > 1).ToList();
+                // Organs come out as "heart:heart_2_0" (the kind of heart), so count by prefix.
+                Func<int> haveOut = () => outIds.Sum(id => me.data.GetTotalCount(id, true) +
+                    me.data.inventory.Where(i => i != null && i.id != null && i.id.StartsWith(id + ":")).Sum(i => i.value));
                 int outBefore = haveOut();
                 Func<int> dropsAtStation = () => outIds.Sum(id => Drops(id).Count(d => Vector2.Distance(d.transform.position, station.transform.position) < 400f));
                 int dropsBefore = dropsAtStation();
+                string stationBefore = StationState(station);
                 // Walk up to the station from each side (keyboard walking) until the game
                 // highlights it as the object in front of the player.
                 var inter = me.components.interaction;
@@ -558,9 +627,24 @@ namespace CoopQA
                     yield return Bot.Wait(0.4f);
                     if (inter.nearest == station) break;
                 }
+                // Stations worked from a dock point (graves): stand on the closest one, as the
+                // player's walk to it would end there (the start spot may have no path).
+                var docks = HarmonyLib.AccessTools.Field(typeof(WorldGameObject), "_dock_points").GetValue(station) as DockPoint[];
+                if (docks != null && docks.Length > 0)
+                {
+                    var dp = docks.Where(x => x != null).OrderBy(x => ((Vector2)x.transform.position - me.pos).sqrMagnitude).FirstOrDefault();
+                    if (dp != null)
+                    {
+                        me.PlaceAtPos(dp.transform.position);
+                        yield return Bot.Wait(0.4f);
+                        Bot.Step($"info stood on a dock point ({docks.Length} total); nearest={inter.nearest?.obj_id}");
+                    }
+                }
                 Bot.Step($"info nearest after walking up: {inter.nearest?.obj_id}#{inter.nearest?.unique_id} tool={me.GetEquippedTool()?.id}");
-                Bot.Step("info before start: " + string.Join(",", craft.needs.Select(n => $"{n.id} {me.data.GetTotalCount(n.id, true)}/{n.value}")));
-                bool started = cc.CraftAsPlayer(craft);   // what clicking the recipe does
+                Bot.Step("info before start: " + string.Join(",", craft.needs.Select(n => $"{n.id} {me.data.GetTotalCount(n.id, true)}/{n.value}")) +
+                         $" craft tools=[{string.Join(",", craft.tool_actions.action_tools)}] station tools=[{string.Join(",", station.obj_def.tool_actions.action_tools)}]" +
+                         $" belt=[{string.Join(",", me.data.secondary_inventory.Where(i => i != null && !i.IsEmpty()).Select(i => i.id + ":" + i.definition?.type))}]");
+                bool started = start != null ? start(station, craft) : cc.CraftAsPlayer(craft);   // what clicking the recipe does
                 me.temp_do_work = true;   // holding the work key
                 Bot.Publish("craft", $"{station.unique_id}|{craft.id}|{string.Join(";", outIds)}");
                 // A client first gets the station lease from the host; the craft starts after that.
@@ -568,13 +652,25 @@ namespace CoopQA
                 yield return Bot.WaitUntil("craft running", () => cc.is_crafting, 8f);
                 Bot.Step($"info craft started={started} after {UnityEngine.Time.realtimeSinceStartup - s0:F2}s");
                 float t0 = UnityEngine.Time.realtimeSinceStartup;
-                while (cc.is_crafting && UnityEngine.Time.realtimeSinceStartup - t0 < 60f) yield return null;
+                float lastLog = t0;
+                while (cc.is_crafting && UnityEngine.Time.realtimeSinceStartup - t0 < 60f)
+                {
+                    if (UnityEngine.Time.realtimeSinceStartup - lastLog > 10f)
+                    {
+                        lastLog = UnityEngine.Time.realtimeSinceStartup;
+                        Bot.Step($"info still crafting: progress={F(station.progress)} tool={me.GetEquippedTool()?.id} nearest={inter.nearest?.obj_id} energy={F(me.energy)}");
+                    }
+                    yield return null;
+                }
                 me.temp_do_work = false;
                 Bot.Check("craft finished while working", !cc.is_crafting, $"after {UnityEngine.Time.realtimeSinceStartup - t0:F1}s");
                 yield return Bot.Wait(2f);
                 int got = haveOut() - outBefore + dropsAtStation() - dropsBefore;
-                Bot.Check("crafted item received (inventory or ground)", got > 0, $"+{got}");
-                Bot.Publish("craft_done", "1");
+                if (outIds.Count > 0)
+                    Bot.Check("crafted item received (inventory or ground)", got > 0, $"+{got}");
+                Bot.Step($"info station before [{stationBefore}] after [{StationState(station)}] params: {station.data.GetParam("quality", -1f)}");
+                Bot.Publish("craft_changed", StationState(station) != stationBefore || got > 0 ? "1" : "0");
+                Bot.Publish("craft_done", StationState(station));
                 yield return Bot.WaitRemote(Other, "craft_seen", "1", 40f);
             }
             else
@@ -596,6 +692,10 @@ namespace CoopQA
                 Bot.Step($"info saw the station working={sawCrafting} craft={sawCraft} expected={p[1]}");
                 Bot.Check("same recipe on the station", !sawCrafting || sawCraft == p[1], $"{sawCraft} vs {p[1]}");
                 yield return Bot.WaitUntil("station idle again here", () => !station.components.craft.is_crafting, 10f);
+                string theirs = Bot.Remote(crafter, "craft_done");
+                Bot.Check("the work changed the station", Bot.Remote(crafter, "craft_changed") != "0", "crafter saw no change");
+                yield return Bot.WaitUntil("station contents match the crafter's", () => StationState(station) == theirs, 10f);
+                Bot.Step($"info station here [{StationState(station)}] there [{theirs}]");
                 Bot.Publish("craft_seen", "1");
             }
         }
@@ -887,6 +987,26 @@ namespace CoopQA
             var ds = GraveyardKeeperCoop.Multiplayer.DialogueSync.Instance;
             Bot.Check("not stuck in a synced dialogue", ds == null || !ds.IsInSyncedDialogue);
             Bot.Check("no answer menu left open", OpenAnswers() == null);
+        }
+
+
+        // ------------------------------------------------------------------ morgue and graves
+        private static IEnumerator MorgueProbe()
+        {
+            if (!Bot.IsHost) yield break;
+            var me = MainGame.me.player;
+            Func<WorldGameObject, string> d = w => $"{w.obj_id}#{w.unique_id}@{F((w.pos - me.pos).magnitude / 96f)}t";
+            var graves = WorldMap.objs.Where(w => w?.obj_def != null && w.obj_def.interaction_type == ObjectDefinition.InteractionType.Grave).ToList();
+            Bot.Step($"info graves ({graves.Count}): " + string.Join(",", graves.GroupBy(g => g.obj_id).Select(g => g.Key + "x" + g.Count())));
+            foreach (var g in graves.OrderBy(g => (g.pos - me.pos).sqrMagnitude).Take(4))
+                Bot.Step($"     grave {d(g)} inv=[{Items(g.data.inventory)}] crafts=[{string.Join(",", g.components?.craft?.crafts?.Take(6).Select(c => c.id) ?? new string[0])}]");
+            foreach (var w in WorldMap.objs.Where(w => w != null && w.obj_id != null &&
+                     (w.is_autopsy_table || w.obj_id.Contains("morgue") || w.obj_id.Contains("body") || w.obj_id.Contains("corpse") || w.obj_id.Contains("grave_place") || w.obj_id.Contains("empty_grave"))).Take(20))
+                Bot.Step($"     obj {d(w)} autopsy={w.is_autopsy_table} type={w.obj_def?.interaction_type} inv=[{Items(w.data.inventory)}] crafts=[{string.Join(",", w.components?.craft?.crafts?.Take(8).Select(c => c.id) ?? new string[0])}]");
+            var bodyItems = GameBalance.me.items_data.Where(i => i != null && i.type == ItemDefinition.ItemType.Body).Select(i => i.id).Take(20);
+            Bot.Step("info body item ids: " + string.Join(",", bodyItems));
+            Bot.Step($"info overhead={MainGame.me.player_char.GetOverheadItem()?.id}");
+            yield break;
         }
 
         // ------------------------------------------------------------------ gathering and combat
