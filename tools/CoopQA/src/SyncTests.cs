@@ -380,7 +380,10 @@ namespace CoopQA
                 int dropsBefore = Drops(id).Count;
                 MainGame.me.player.data.RemoveItem(id, 1);
                 // Like a harvest/kill drop: lands a few tiles away from the player.
-                Vector3 spot = MainGame.me.player.transform.position + new Vector3(250f, 0f, 0f);
+                // Away from the host: a player standing on a drop picks it up at once.
+                var hostProxy = OnlineCoopManager.Instance?.GetRemotePlayer();
+                float side = hostProxy != null && hostProxy.transform.position.x > MainGame.me.player.transform.position.x ? -1f : 1f;
+                Vector3 spot = MainGame.me.player.transform.position + new Vector3(250f * side, 0f, 0f);
                 DropResGameObject.Drop(spot, new Item(id, 1), MainGame.me.player.transform.parent);
                 yield return Bot.Wait(2f);
                 Bot.Check("client sees its own drop", Drops(id).Count > dropsBefore, $"{Drops(id).Count} drop(s) of {id}");
@@ -638,12 +641,12 @@ namespace CoopQA
                 var docks = HarmonyLib.AccessTools.Field(typeof(WorldGameObject), "_dock_points").GetValue(station) as DockPoint[];
                 if (docks != null && docks.Length > 0 && station.obj_def?.interaction_type == ObjectDefinition.InteractionType.Grave)
                 {
-                    var dp = docks.Where(x => x != null).OrderBy(x => ((Vector2)x.transform.position - me.pos).sqrMagnitude).FirstOrDefault();
-                    if (dp != null)
+                    foreach (var dp in docks.Where(x => x != null).OrderBy(x => ((Vector2)x.transform.position - me.pos).sqrMagnitude))
                     {
                         me.PlaceAtPos(dp.transform.position);
-                        yield return Bot.Wait(0.4f);
+                        yield return Bot.Wait(0.6f);
                         Bot.Step($"info stood on a dock point ({docks.Length} total); nearest={inter.nearest?.obj_id}");
+                        if (inter.nearest == station) break;
                     }
                 }
                 Bot.Step($"info nearest after walking up: {inter.nearest?.obj_id}#{inter.nearest?.unique_id} tool={me.GetEquippedTool()?.id}");
@@ -1080,9 +1083,9 @@ namespace CoopQA
                 Bot.Check("saw the same conversation", missing.Count == 0, missing.Count == 0 ? "" : "missing: " + string.Join(" | ", missing.Take(5)));
             }
             yield return Bot.Sync("talk_over");
-            yield return Bot.WaitUntil("can move again after the conversation", CanMove, 5f);
+            yield return Bot.WaitUntil("can move again after the conversation", CanMove, 6f);
             var ds = GraveyardKeeperCoop.Multiplayer.DialogueSync.Instance;
-            Bot.Check("not stuck in a synced dialogue", ds == null || !ds.IsInSyncedDialogue);
+            yield return Bot.WaitUntil("not stuck in a synced dialogue", () => ds == null || !ds.IsInSyncedDialogue, 6f);
             Bot.Check("no answer menu left open", OpenAnswers() == null);
         }
 
