@@ -35,7 +35,7 @@ namespace CoopQA
         private static bool MainMenuUp() =>
             GUIElements.me != null && GUIElements.me.main_menu != null && GUIElements.me.main_menu.is_shown && !LoadingGUI.is_shown;
 
-        private static bool InSession()
+        internal static bool InSession()
         {
             var ocm = OnlineCoopManager.Instance;
             return MainGame.game_started && MainGame.me?.player != null && ocm != null && ocm.IsOnlineCoopEnabled &&

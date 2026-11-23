@@ -42,10 +42,16 @@ namespace CoopQA
             // Replace a grave's wooden fence with a stone one (host) / another stone one (client).
             new KeyValuePair<string, Func<IEnumerator>>("grave_host", () => Craft(1, IsGrave, c => c.id == "set_grave_bot_stn_1", StartGravePart)),
             new KeyValuePair<string, Func<IEnumerator>>("grave_client", () => Craft(2, IsGrave, c => c.id == "set_grave_bot_stn_2", StartGravePart)),
+            new KeyValuePair<string, Func<IEnumerator>>("trade_host", () => Trade(1)),
+            new KeyValuePair<string, Func<IEnumerator>>("trade_client", () => Trade(2)),
             new KeyValuePair<string, Func<IEnumerator>>("sleep_rested_client", () => Sleep(clientTired: false, wakeWithKey: false)),
             new KeyValuePair<string, Func<IEnumerator>>("sleep_wake_with_key", () => Sleep(clientTired: true, wakeWithKey: true)),
             new KeyValuePair<string, Func<IEnumerator>>("time_after_sleep", Time),
             new KeyValuePair<string, Func<IEnumerator>>("progress_after_sleep", Progress),
+            new KeyValuePair<string, Func<IEnumerator>>("rejoin", Rejoin),
+            new KeyValuePair<string, Func<IEnumerator>>("see_each_other_after_rejoin", SeeEachOther),
+            new KeyValuePair<string, Func<IEnumerator>>("move_client_after_rejoin", () => Move(mover: 2)),
+            new KeyValuePair<string, Func<IEnumerator>>("trade_client_after_rejoin", () => Trade(2)),
         };
 
         /// <summary>Only run when named in a suite filter (they end or need a prepared session).</summary>
@@ -785,6 +791,82 @@ namespace CoopQA
             }
         }
 
+
+        /// <summary>Mid-game drop: the friend leaves to the main menu, the host keeps playing,
+        /// invites again, and the friend comes back into the running game with their things.</summary>
+        private static IEnumerator Rejoin()
+        {
+            var ocm = OnlineCoopManager.Instance;
+            if (!Bot.IsHost)
+            {
+                var me = MainGame.me.player;
+                me.data.AddItem("stick", 2);
+                me.data.money += 0.5f;
+                var before = PersonalState();
+                Bot.Step("info leaving with: " + string.Join(" ", before.Select(kv => kv.Key + "=" + kv.Value)));
+                Bot.LastInviteLobby = 0;
+                Bot.Publish("leaving", "1");
+                yield return Bot.Wait(1f);
+                GUIElements.me.ingame_menu.ReturnToMainMenu();
+                yield return Bot.WaitUntil("friend back in the main menu",
+                    () => GUIElements.me.main_menu.is_shown && !MainGame.game_started && !LoadingGUI.is_shown, 60f);
+                Bot.Publish("in_menu", "1");
+                yield return Bot.WaitUntil("invited again", () => Bot.LastInviteLobby != 0, 90f);
+                yield return Bot.Wait(1.5f);
+                Bot.Call(SteamLobbyManager.Instance, "AcceptInvite", new Steamworks.CSteamID(Bot.LastInviteLobby), "QA-P1");
+                bool pressedReady = false;
+                float t0 = UnityEngine.Time.realtimeSinceStartup;
+                while (!Tests.InSession() && UnityEngine.Time.realtimeSinceStartup - t0 < 240f)
+                {
+                    if (!pressedReady && GraveyardKeeperCoop.UI.LobbyGUI.Instance != null && GraveyardKeeperCoop.UI.LobbyGUI.Instance.is_shown)
+                    {
+                        yield return Bot.Wait(2f);
+                        Bot.Step("info lobby screen shown on rejoin; pressing Ready");
+                        Bot.Call(GraveyardKeeperCoop.UI.LobbyGUI.Instance, "OnReadyPressed");
+                        pressedReady = true;
+                    }
+                    yield return null;
+                }
+                Bot.Check("back in the running game", Tests.InSession(), $"after {UnityEngine.Time.realtimeSinceStartup - t0:F0}s");
+                if (!Tests.InSession()) { Bot.Publish("rejoined", "fail"); yield break; }
+                yield return Bot.Wait(3f);
+                me = MainGame.me.player;
+                var after = PersonalState();
+                Bot.Step("info back with: " + string.Join(" ", after.Select(kv => kv.Key + "=" + kv.Value)));
+                Bot.Check("same day as the host", after["day"] == Bot.Remote(1, "host_day"), $"{after["day"]} vs {Bot.Remote(1, "host_day")}");
+                // By design the personal state is committed only with a host save (sleep), so what
+                // was picked up since then is rolled back on rejoin. Report it, do not fail on it.
+                Bot.Step(after["bag"] == before["bag"] && after["money"] == before["money"]
+                    ? "info bag and money kept"
+                    : $"info rolled back to the last host save: bag [{before["bag"]}] -> [{after["bag"]}], money {before["money"]} -> {after["money"]}");
+                Bot.Check("toolbelt kept", after["toolbelt"] == before["toolbelt"], $"left [{before["toolbelt"]}] back [{after["toolbelt"]}]");
+                Bot.Publish("rejoined", "1");
+                // A player needs a few seconds to walk anywhere; meanwhile the host's full
+                // world state (several hundred KB) finishes arriving.
+                yield return Bot.Wait(10f);
+                yield return Bot.Sync("rejoin_done");
+            }
+            else
+            {
+                yield return Bot.WaitRemote(2, "leaving", "1", 30f);
+                yield return Bot.WaitUntil("host notices the friend left", () => ocm.RemotePlayerCount == 0, 30f);
+                Bot.Check("host still in the game", MainGame.game_started && MainGame.me?.player != null && !GUIElements.me.main_menu.is_shown);
+                yield return Bot.WaitRemote(2, "in_menu", "1", 60f);
+                // Keep playing a little while alone.
+                var me = MainGame.me.player;
+                me.PlaceAtPos(me.pos + new Vector2(96f, 0f));
+                yield return Bot.Wait(3f);
+                Bot.Check("host still in a lobby to invite into", SteamLobbyManager.Instance.IsInLobby);
+                Bot.Publish("host_day", MainGame.me.save.day.ToString());
+                Bot.Require("invite sent again", SteamLobbyManager.Instance.InviteFriend(new Steamworks.CSteamID(Bot.IdOf(2))));
+                yield return Bot.WaitUntil("friend rejoined", () => Bot.Remote(2, "rejoined") != null, 300f);
+                Bot.Check("friend is back in the game", Bot.Remote(2, "rejoined") == "1");
+                if (Bot.Remote(2, "rejoined") != "1") yield break;
+                yield return Bot.WaitUntil("host sees the friend again", () => ocm.RemotePlayerCount == 1, 30f);
+                yield return Bot.Sync("rejoin_done");
+            }
+        }
+
         private static Dictionary<string, string> ReadState(int player)
         {
             var f = PersistFile(player);
@@ -989,6 +1071,95 @@ namespace CoopQA
             Bot.Check("no answer menu left open", OpenAnswers() == null);
         }
 
+
+
+        // ------------------------------------------------------------------ trading
+        private static string VendorState(WorldGameObject w) =>
+            w?.data == null ? "none" : $"money={F(w.data.GetParam("money"))} stock=[{Items(w.data.inventory)}]";
+
+        /// <summary>Buy one item from a vendor the way VendorGUI does (move it into the vendor's
+        /// offer, accept). The buyer pays and gets it; the vendor looks the same on both sides
+        /// and stays that way; the partner's money does not change.</summary>
+        private static IEnumerator Trade(int buyer)
+        {
+            var me = MainGame.me.player;
+            float myMoney0 = me.data.money;
+            Bot.Publish("money0_" + buyer, F(myMoney0));
+            if (Plugin.Player == buyer)
+            {
+                WorldGameObject v = null; Item ware = null; float price = 0f;
+                foreach (var w in WorldMap.objs.Where(w => w != null && w.unique_id > 0 && !w.is_player && w.obj_def != null &&
+                                                           GameBalance.me.GetDataOrNull<VendorDefinition>(w.obj_id) != null)
+                                               .OrderBy(w => (w.pos - me.pos).sqrMagnitude))
+                {
+                    var vend = w.vendor;
+                    if (vend == null) continue;
+                    vend.FillDrawingMultiInventory();
+                    ware = w.data.inventory.FirstOrDefault(i => i != null && !i.IsEmpty() && i.value > 0 && vend.CanSellItem(i) &&
+                                                                 vend.GetSingleItemPrice(i) > 0f);
+                    if (ware != null) { v = w; price = vend.GetSingleItemPrice(ware); break; }
+                }
+                Bot.Check("found a vendor with something to sell", v != null);
+                if (v == null) { Bot.Publish("trade", "none"); yield break; }
+                if (me.data.money < price * 2f + 1f) me.data.money += price * 2f + 1f;   // pocket money
+                float money0 = me.data.money;
+                string wareId = ware.id;
+                int have0 = me.data.GetTotalCount(wareId, true);
+                string vendor0 = VendorState(v);
+                Bot.Step($"info buying 1 {wareId} from {v.obj_id}#{v.unique_id} for ~{F(price)}; vendor [{vendor0}] my money {F(money0)}");
+                // Stand at the vendor like a player does (the game only runs objects near the player).
+                yield return WalkUpTo(v, 150f);
+                yield return Bot.Wait(1f);
+                Bot.Step($"info at the vendor: active={v.gameObject.activeInHierarchy} dist={F((v.pos - me.pos).magnitude / 96f)}t");
+                Bot.Publish("trade", $"{v.unique_id}|{wareId}|{F(money0)}");
+                yield return Bot.WaitRemote(Other, "trade_ready", "1", 30f);
+
+                var t = new Trading(v);
+                t.trader.cur_offer.SetInventorySize(6);
+                t.trader.inventory.RemoveItem(new Item(wareId, 1), 1, MultiInventory.DestinationType.AllFromFirst);
+                t.trader.cur_offer.AddItem(wareId, 1);
+                float balance = t.GetTotalBalance();
+                bool can = t.CanAcceptOffer();
+                t.DoAcceptOffer();
+                Bot.Check("the vendor accepted the offer", can, $"balance {F(balance)}");
+                Bot.Check("paid for it", Mathf.Abs(me.data.money - (money0 + balance)) < 0.02f, $"{F(money0)} -> {F(me.data.money)} (balance {F(balance)})");
+                Bot.Check("got the item", me.data.GetTotalCount(wareId, true) == have0 + 1, $"{have0} -> {me.data.GetTotalCount(wareId, true)}");
+                string vendor1 = VendorState(v);
+                Bot.Step($"info vendor after [{vendor1}]");
+                Bot.Check("the vendor changed", vendor1 != vendor0);
+                Bot.Publish("trade_done", vendor1);
+                yield return Bot.WaitRemote(Other, "trade_seen", "1", 40f);
+                // A stale host snapshot must not undo the purchase on either side.
+                yield return Bot.Wait(6f);
+                Bot.Check("the purchase stays here (vendor)", VendorState(v) == vendor1, $"now [{VendorState(v)}]");
+                Bot.Check("the purchase stays here (item and money)",
+                          me.data.GetTotalCount(wareId, true) == have0 + 1 && Mathf.Abs(me.data.money - (money0 + balance)) < 0.02f,
+                          $"items {me.data.GetTotalCount(wareId, true)}, money {F(me.data.money)}");
+                Bot.Publish("trade_final", VendorState(v));
+                yield return Bot.WaitRemote(Other, "trade_final_seen", "1", 30f);
+            }
+            else
+            {
+                yield return Bot.WaitUntil("buyer picked a vendor", () => Bot.Remote(buyer, "trade") != null, 40f);
+                if (Bot.Remote(buyer, "trade") == "none") yield break;
+                var p = Bot.Remote(buyer, "trade").Split('|');
+                var v = WorldMap.GetWorldGameObjectByUniqueId(long.Parse(p[0]), false);
+                Bot.Check("the vendor exists here", v != null);
+                Bot.Step($"info vendor here before [{VendorState(v)}]");
+                Bot.Publish("trade_ready", "1");
+                yield return Bot.WaitUntil("buyer finished", () => Bot.Remote(buyer, "trade_done") != null, 40f);
+                string theirs = Bot.Remote(buyer, "trade_done");
+                yield return Bot.WaitUntil("the vendor looks the same here", () => VendorState(v) == theirs, 15f);
+                Bot.Step($"info vendor here [{VendorState(v)}] there [{theirs}]");
+                Bot.Publish("trade_seen", "1");
+                yield return Bot.WaitUntil("buyer checked it stays", () => Bot.Remote(buyer, "trade_final") != null, 30f);
+                yield return Bot.Wait(1f);
+                Bot.Check("the vendor still looks the same here", VendorState(v) == Bot.Remote(buyer, "trade_final"),
+                          $"here [{VendorState(v)}] there [{Bot.Remote(buyer, "trade_final")}]");
+                Bot.Check("my money did not change", Mathf.Abs(me.data.money - myMoney0) < 0.02f, $"{F(myMoney0)} -> {F(me.data.money)}");
+                Bot.Publish("trade_final_seen", "1");
+            }
+        }
 
         // ------------------------------------------------------------------ morgue and graves
         private static IEnumerator MorgueProbe()

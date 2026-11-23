@@ -152,7 +152,7 @@ namespace CoopQA
         public static string Scope = "";
 
         private static string Scoped(string k) =>
-            k.StartsWith("sync.") || k == "result" || k == "state" || Scope.Length == 0 ? k : Scope + "/" + k;
+            k == "result" || k == "state" || Scope.Length == 0 ? k : Scope + "/" + k;
 
         public static void Publish(string k, string v)
         {
