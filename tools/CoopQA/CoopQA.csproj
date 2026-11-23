@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Test-only plugin: fakes Steamworks.NET over a localhost broker and drives an in-game bot.
+       Does nothing unless the game is started with -coopqa. Never ship to players. -->
+  <PropertyGroup>
+    <TargetFramework>net46</TargetFramework>
+    <AssemblyName>CoopQA</AssemblyName>
+    <LangVersion>latest</LangVersion>
+    <GamePath Condition="'$(GamePath)' == ''">/mnt/FedoraData/SteamLibrary/steamapps/common/Graveyard Keeper</GamePath>
+    <Managed>$(GamePath)/Graveyard Keeper_Data/Managed</Managed>
+    <BepCore>$(MSBuildThisFileDirectory)../../deps/bepinex/BepInEx/core</BepCore>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.2" PrivateAssets="all" />
+    <Reference Include="BepInEx"><HintPath>$(BepCore)/BepInEx.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="0Harmony"><HintPath>$(BepCore)/0Harmony.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine"><HintPath>$(Managed)/UnityEngine.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine.CoreModule"><HintPath>$(Managed)/UnityEngine.CoreModule.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine.ScreenCaptureModule"><HintPath>$(Managed)/UnityEngine.ScreenCaptureModule.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="Assembly-CSharp"><HintPath>$(Managed)/Assembly-CSharp.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="Assembly-CSharp-firstpass"><HintPath>$(Managed)/Assembly-CSharp-firstpass.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="Newtonsoft.Json"><HintPath>$(Managed)/Newtonsoft.Json.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="netstandard"><HintPath>$(Managed)/netstandard.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="GraveyardKeeperCoop"><HintPath>$(MSBuildThisFileDirectory)../../repo/bin/Release/net46/GraveyardKeeperCoop.dll</HintPath><Private>false</Private></Reference>
+  </ItemGroup>
+</Project>

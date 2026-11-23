@@ -1,0 +1,16 @@
+# Game copies and test runs (qa/P1, qa/P2 are copies of the game)
+qa/
+# Downloaded BepInEx and built packages
+deps/
+dist/
+# Decompiled game code: copyrighted by the game's authors, local reference only
+docs/decompiled/
+# Build output
+bin/
+obj/
+*.user
+.vs/
+# Private working notes (not part of the public mod)
+docs/
+claude-code/
+probe/
