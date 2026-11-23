@@ -44,6 +44,10 @@ namespace CoopQA
             new KeyValuePair<string, Func<IEnumerator>>("grave_client", () => Craft(2, IsGrave, c => c.id == "set_grave_bot_stn_2", StartGravePart)),
             new KeyValuePair<string, Func<IEnumerator>>("trade_host", () => Trade(1)),
             new KeyValuePair<string, Func<IEnumerator>>("trade_client", () => Trade(2)),
+            new KeyValuePair<string, Func<IEnumerator>>("fishing_host", () => Fishing(1)),
+            new KeyValuePair<string, Func<IEnumerator>>("fishing_client", () => Fishing(2)),
+            new KeyValuePair<string, Func<IEnumerator>>("build_host", () => Build(1)),
+            new KeyValuePair<string, Func<IEnumerator>>("build_client", () => Build(2)),
             new KeyValuePair<string, Func<IEnumerator>>("sleep_rested_client", () => Sleep(clientTired: false, wakeWithKey: false)),
             new KeyValuePair<string, Func<IEnumerator>>("sleep_wake_with_key", () => Sleep(clientTired: true, wakeWithKey: true)),
             new KeyValuePair<string, Func<IEnumerator>>("time_after_sleep", Time),
@@ -60,6 +64,7 @@ namespace CoopQA
             new KeyValuePair<string, Func<IEnumerator>>("session_end", SessionEnd),
             new KeyValuePair<string, Func<IEnumerator>>("resume_check", ResumeCheck),
             new KeyValuePair<string, Func<IEnumerator>>("morgue_probe", MorgueProbe),
+            new KeyValuePair<string, Func<IEnumerator>>("dungeon_probe", DungeonProbe),
         };
 
         private static int Other => Bot.IsHost ? 2 : 1;
@@ -1176,6 +1181,314 @@ namespace CoopQA
                           $"here [{VendorState(v)}] there [{Bot.Remote(buyer, "trade_final")}]");
                 Bot.Check("my money did not change", Mathf.Abs(me.data.money - myMoney0) < 0.02f, $"{F(myMoney0)} -> {F(me.data.money)}");
                 Bot.Publish("trade_final_seen", "1");
+            }
+        }
+
+
+
+
+        // ------------------------------------------------------------------ dungeon
+        private static string DungeonInfo()
+        {
+            var root = MainGame.me.dungeon_root;
+            var save = MainGame.me.save;
+            var me = MainGame.me.player;
+            var near = WorldMap.objs.Where(w => w != null && !w.is_removed && w.obj_id != null && Vector2.Distance(w.pos, me.pos) < 1500f)
+                                    .GroupBy(w => w.obj_id).Select(g => $"{g.Key}x{g.Count()}");
+            return $"loaded={root.dungeon_is_loaded_now} level={root.cur_dungeon_preset?.dungeon_level} seed={save.dungeon_seed} " +
+                   $"completed={root.cur_saved_dungeon?.is_completed} pos={V(me.pos)} near: {string.Join(",", near.Take(40))}";
+        }
+
+        /// <summary>Explore: the host enters dungeon level 1, both report what they see.</summary>
+        private static IEnumerator DungeonProbe()
+        {
+            var me = MainGame.me.player;
+            Bot.Step("info before: " + DungeonInfo());
+            Bot.Step("info dungeon objects in the world: " + string.Join(",", WorldMap.objs.Where(w => w != null && w.obj_id != null && w.obj_id.Contains("dung")).Select(w => $"{w.obj_id}@{V(w.pos)}").Take(10)));
+            if (Bot.IsHost)
+            {
+                MainGame.me.TeleportToDungeonLevel(1);
+                yield return Bot.Wait(5f);
+                Bot.Step("info in dungeon: " + DungeonInfo());
+                Bot.Publish("dungeon_in", "1");
+                yield return Bot.Wait(10f);
+            }
+            else
+            {
+                yield return Bot.WaitUntil("host entered", () => Bot.Remote(1, "dungeon_in") != null, 60f);
+                yield return Bot.Wait(3f);
+                var host = OnlineCoopManager.Instance?.GetRemotePlayer();
+                Bot.Step($"info host proxy at {(host == null ? "none" : V(host.transform.position) + " active=" + host.gameObject.activeInHierarchy)}");
+                Bot.Step("info client: " + DungeonInfo());
+                MainGame.me.TeleportToDungeonLevel(1);
+                yield return Bot.Wait(5f);
+                Bot.Step("info client in dungeon: " + DungeonInfo());
+                host = OnlineCoopManager.Instance?.GetRemotePlayer();
+                Bot.Step($"info host proxy at {(host == null ? "none" : V(host.transform.position) + " active=" + host.gameObject.activeInHierarchy)}");
+            }
+        }
+
+        // ------------------------------------------------------------------ building
+        private static readonly System.Reflection.FieldInfo GamepadActiveF = HarmonyLib.AccessTools.Field(typeof(LazyInput), "_gamepad_active");
+        private static readonly System.Reflection.FieldInfo BuildModeF = HarmonyLib.AccessTools.Field(typeof(BuildModeLogics), "_mode");
+
+        private static string BuildMode() => BuildModeF.GetValue(MainGame.me.build_mode_logics)?.ToString();
+
+        private static List<WorldGameObject> BuiltNear(string outObj, Vector2 at, float r = 120f) =>
+            WorldMap.objs.Where(w => w != null && !w.is_removed && w.obj_id != null &&
+                                     (w.obj_id == outObj || w.obj_id == outObj + "_place") &&
+                                     Vector2.Distance(w.pos, at) < r).ToList();
+
+        /// <summary>Build like a player: open the build desk, pick a recipe, place it in the zone.
+        /// The partner sees the new object at the same spot; the materials leave only the builder's bag.</summary>
+        private static IEnumerator Build(int builder)
+        {
+            var me = MainGame.me.player;
+            if (Plugin.Player == builder)
+            {
+                Func<WorldGameObject, List<ObjectCraftDefinition>> putCrafts = d =>
+                    GameBalance.me.craft_obj_data.Where(c => c != null && c.builder_ids.Contains(d.obj_id) &&
+                        c.build_type == ObjectCraftDefinition.BuildType.Put && MainGame.me.save.IsCraftVisible(c) &&
+                        string.IsNullOrEmpty(c.sub_zone_id) && string.IsNullOrEmpty(c.end_script) && !c.one_time_craft &&
+                        c.needs.All(n => GameBalance.me.GetDataOrNull<ItemDefinition>(n.id) != null)).ToList();
+                var desks = WorldMap.objs.Where(w => w != null && !w.is_removed && w.obj_def != null &&
+                                                    !string.IsNullOrEmpty(w.obj_def.zone_id) && putCrafts(w).Count > 0)
+                                         .OrderBy(w => (w.pos - me.pos).sqrMagnitude).ToList();
+                Bot.Step("info build desks: " + string.Join(",", desks.Take(6).Select(d => $"{d.obj_id}@{d.obj_def.zone_id}({putCrafts(d).Count})")));
+                // Each builder starts at its own desk (the host's build can fill the only free spot);
+                // a recipe with no free spot in its zone is cancelled and the next one tried.
+                var order = desks.Skip(builder - 1).Concat(desks.Take(builder - 1)).ToList();
+                var candidates = order.SelectMany(d => putCrafts(d).OrderBy(c => c.needs.Sum(n => n.value)).Take(2).Select(c => new { d, c })).Take(6).ToList();
+                Bot.Check("found a build desk", candidates.Count > 0);
+                if (candidates.Count == 0) { Bot.Publish("built", "none"); yield break; }
+                WorldGameObject desk = null; ObjectCraftDefinition cd = null;
+                string bag0 = null;
+                Vector2 spot = Vector2.zero; bool free = false;
+                object wasGamepad = GamepadActiveF.GetValue(null);
+                foreach (var cand in candidates)
+                {
+                    desk = cand.d; cd = cand.c;
+                    Bot.Step($"info building {cd.id} -> {cd.out_obj}, needs {Items(cd.needs)} at {desk.obj_id} (zone {desk.obj_def.zone_id})");
+                    foreach (var n in cd.needs)
+                        me.data.AddItem(n.id, n.value);
+                    bag0 = Items(me.data.inventory);
+
+                    yield return WalkUpTo(desk);
+                    MainGame.me.OpenBuildObjectGUI(desk);       // E on the build desk
+                    yield return Bot.Wait(1f);
+                    Bot.Check("build menu open", GUIElements.me.craft.is_shown);
+                    GamepadActiveF.SetValue(null, true);         // move the blueprint with keys, not the mouse
+                    try { MainGame.me.build_mode_logics.CraftBuilding(cd); }   // click on the recipe
+                    catch (Exception e) { Bot.Step("FAIL picking the recipe: " + e.Message); }
+                    yield return Bot.Wait(0.5f);
+                    Bot.Check("placing a blueprint", BuildMode() == "Placing" && FloatingWorldGameObject.cur_floating != null, BuildMode());
+
+                    // Find a free spot in the zone, near the desk.
+                    var b = WorldZone.GetZoneByID(desk.obj_def.zone_id).GetBounds();
+                    var tries = new List<Vector2>();
+                    for (float x = b.min.x + 96f; x < b.max.x - 96f; x += 96f)
+                        for (float y = b.min.y + 96f; y < b.max.y - 96f; y += 96f)
+                            tries.Add(new Vector2(x, y));
+                    int freeCells = 0;
+                    bool canAfford = MainGame.me.build_mode_logics.CanBuild(cd);
+                    foreach (var t in tries.OrderBy(t => (t - (Vector2)desk.pos).sqrMagnitude).Take(400))
+                    {
+                        if (FloatingWorldGameObject.cur_floating == null) break;
+                        FloatingWorldGameObject.MoveCurrentFloatingObject(t);
+                        yield return null;
+                        if (FloatingWorldGameObject.can_be_built) freeCells++;
+                        if (FloatingWorldGameObject.can_be_built && MainGame.me.build_mode_logics.CanBuild(cd)) { spot = t; free = true; break; }
+                    }
+                    Bot.Step($"info {tries.Count} spots in the zone; free {freeCells}; can afford {canAfford}");
+                    if (free) break;
+                    // Back out like a player (Esc while placing, then close the menu) and give the materials back.
+                    yield return FakeInput.Press(GameKey.Back);
+                    yield return Bot.Wait(0.6f);
+                    if (GUIElements.me.craft.is_shown) { GUIElements.me.craft.OnClosePressed(); yield return Bot.Wait(0.6f); }
+                    foreach (var n in cd.needs)
+                        me.data.RemoveItem(n.id, n.value);
+                }
+                Bot.Check("found a free spot in the zone", free);
+                var preview = FloatingWorldGameObject.cur_floating?.wobj;
+                Vector2 placedAt = preview != null ? (Vector2)preview.pos : spot;
+                var before = new HashSet<WorldGameObject>(BuiltNear(cd.out_obj, placedAt, 400f).Where(w => w != preview));
+                if (free)
+                {
+                    yield return FakeInput.Press(GameKey.Interaction);   // place it
+                    yield return Bot.Wait(1f);
+                }
+                var built = BuiltNear(cd.out_obj, placedAt).FirstOrDefault(w => !before.Contains(w) && w != FloatingWorldGameObject.cur_floating?.wobj);
+                Bot.Check("blueprint placed", built != null, built == null ? $"nothing at {V(placedAt)}" : $"{built.obj_id}#{built.unique_id} at {V(built.pos)}");
+                if (cd.needs.Count > 0)
+                    Bot.Check("materials used", Items(me.data.inventory) != bag0, $"[{bag0}] -> [{Items(me.data.inventory)}]");
+
+                // Leave build mode: Back out of placing, then close the build menu.
+                for (int i = 0; i < 4 && (BuildMode() == "Placing" || GUIElements.me.craft.is_shown || MainGame.me.game_mode == MainGame.GameMode.Building); i++)
+                {
+                    yield return FakeInput.Press(GameKey.Back);
+                    yield return Bot.Wait(0.6f);
+                    if (GUIElements.me.craft.is_shown) { GUIElements.me.craft.OnClosePressed(); yield return Bot.Wait(0.6f); }
+                }
+                GamepadActiveF.SetValue(null, wasGamepad);
+                Bot.Check("left build mode", MainGame.me.game_mode != MainGame.GameMode.Building && !GUIElements.me.craft.is_shown,
+                          $"mode={MainGame.me.game_mode} build={BuildMode()} menu={GUIElements.me.craft.is_shown}");
+                yield return Bot.WaitUntil("can move again", CanMove, 5f);
+                Bot.Publish("built", built == null ? "none" : $"{built.obj_id}|{F(built.pos.x)}|{F(built.pos.y)}|{cd.out_obj}");
+                yield return Bot.WaitRemote(Other, "build_seen", "1", 40f);
+            }
+            else
+            {
+                string bag0 = Items(me.data.inventory);
+                yield return Bot.WaitUntil("builder done", () => Bot.Remote(builder, "built") != null, 120f);
+                string r = Bot.Remote(builder, "built");
+                if (r != "none")
+                {
+                    var p = r.Split('|');
+                    var at = new Vector2(PF(p[1]), PF(p[2]));
+                    yield return Bot.WaitUntil($"I see the {p[0]} at the same spot", () => BuiltNear(p[3], at, 48f).Any(w => w.obj_id == p[0]), 20f);
+                    var mine = BuiltNear(p[3], at, 400f);
+                    Bot.Check("exactly one copy here", mine.Count(w => Vector2.Distance(w.pos, at) < 48f) == 1, string.Join(",", mine.Select(w => $"{w.obj_id}@{V(w.pos)}")));
+                    Bot.Check("my bag unchanged", Items(me.data.inventory) == bag0, $"[{bag0}] -> [{Items(me.data.inventory)}]");
+                }
+                Bot.Publish("build_seen", "1");
+            }
+        }
+
+        // ------------------------------------------------------------------ fishing
+        private static readonly System.Reflection.FieldInfo FishingStateF = HarmonyLib.AccessTools.Field(typeof(FishingGUI), "_state");
+        private static readonly System.Reflection.MethodInfo FishingChangeState = HarmonyLib.AccessTools.Method(typeof(FishingGUI), "ChangeState");
+
+        private static FishingGUI.FishingState FishState() =>
+            GUIElements.me.fishing == null ? FishingGUI.FishingState.None : (FishingGUI.FishingState)FishingStateF.GetValue(GUIElements.me.fishing);
+
+        private static int RemoteFishers()
+        {
+            var sync = GraveyardKeeperCoop.Multiplayer.FishingPresentationSync.Instance;
+            var remotes = sync == null ? null : HarmonyLib.AccessTools.Field(sync.GetType(), "remotes").GetValue(sync) as System.Collections.IDictionary;
+            return remotes?.Count ?? 0;
+        }
+
+        /// <summary>Fish like a player: pick the bait (E), hold E to cast, press the minigame key
+        /// on a bite. Only the reel-in minigame (a skill test) is decided through the game's state.
+        /// The partner sees the fishing, the fish lands only in the fisher's bag, nobody is locked.</summary>
+        private static IEnumerator Fishing(int fisher)
+        {
+            var me = MainGame.me.player;
+            string partnerBag0 = Items(me.data.inventory);
+            if (Plugin.Player == fisher)
+            {
+                var spot = WorldMap.objs.Where(w => w != null && w.obj_id != null && GameBalance.me.GetDataOrNull<ReservoirsDefinition>(w.obj_id) != null)
+                                        .OrderBy(w => (w.pos - me.pos).sqrMagnitude).FirstOrDefault();
+                Bot.Check("found a fishing spot", spot != null);
+                if (spot == null) { Bot.Publish("fish", "none"); yield break; }
+                if (me.GetEquippedItem(ItemDefinition.EquipmentType.FishingRod) == null)
+                {
+                    var rodDef = GameBalance.me.items_data.FirstOrDefault(i => i != null && i.equipment_type == ItemDefinition.EquipmentType.FishingRod);
+                    me.data.AddItem(rodDef.id, 1);
+                    me.EquipItem(me.data.inventory.First(i => i != null && i.id == rodDef.id));
+                }
+                // A plain bait (not a fish used as bait for big fish).
+                foreach (var b in new[] { "maggot", "moth", "butterfly" })
+                    if (GameBalance.me.GetDataOrNull<ItemDefinition>(b) != null && me.data.GetItemsCount(b) == 0)
+                        me.data.AddItem(b, 3);
+                // What bites here right now, by the game's fish tables: a bait and a distance with a catch.
+                int rodLvl = int.Parse(me.GetEquippedItem(ItemDefinition.EquipmentType.FishingRod).id.Substring("fishing_rod_".Length));
+                var reservoir = GameBalance.me.GetData<ReservoirsDefinition>(spot.obj_id);
+                string wantBait = null; int wantDist = 0;
+                foreach (var b in new[] { "maggot", "moth", "butterfly", "" })
+                {
+                    for (int dist = 1; dist <= 3 && wantDist == 0; dist++)
+                        if (reservoir.dist_avaliables[dist - 1] &&
+                            GameBalance.me.fishes_data.Any(f => f.GetTotalWeight(spot.obj_id, TimeOfDay.me.is_night, dist, rodLvl, b) > 0.01f))
+                        { wantBait = b; wantDist = dist; }
+                    if (wantDist != 0) break;
+                }
+                Bot.Check("something bites here now", wantDist != 0, $"bait '{wantBait}' at distance {wantDist}, night={TimeOfDay.me.is_night}");
+                if (wantDist == 0) { Bot.Publish("fish", "none"); yield break; }
+                string rod = me.GetEquippedItem(ItemDefinition.EquipmentType.FishingRod)?.id;
+                int baits0 = me.data.inventory.Where(i => i != null && i.definition?.type == ItemDefinition.ItemType.Bait).Sum(i => i.value);
+                var gd = spot.GetComponentInChildren<GDPoint>();
+                me.PlaceAtPos(gd != null ? (Vector2)gd.transform.position : spot.pos);
+                yield return Bot.Wait(1f);
+                Bot.Step($"info fishing at {spot.obj_id}#{spot.unique_id} with {rod}, baits {baits0}");
+                Bot.Publish("fish", $"{spot.unique_id}");
+
+                GUIElements.me.fishing.Open(spot);   // what E on the fishing spot does
+                yield return Bot.WaitUntil("choosing the bait", () => FishState() == FishingGUI.FishingState.BaitChoosing, 5f);
+                yield return Bot.Wait(0.5f);
+                // Pick a bait with the tab keys, like a player.
+                var fgui = GUIElements.me.fishing;
+                var curBait = HarmonyLib.AccessTools.Field(typeof(FishingGUI), "_cur_bait_num");
+                var baitsList = HarmonyLib.AccessTools.Field(typeof(FishingGUI), "_avaliable_baits");
+                Func<string> chosen = () =>
+                {
+                    int n = (int)curBait.GetValue(fgui);
+                    return n >= 0 ? ((List<Item>)baitsList.GetValue(fgui))[n]?.id : null;
+                };
+                for (int i = 0; i < 8 && (chosen() ?? "") != wantBait; i++)
+                {
+                    yield return FakeInput.Press(GameKey.NextTab);
+                    yield return Bot.Wait(0.3f);
+                }
+                int bi = (int)curBait.GetValue(fgui);
+                string baitId = bi >= 0 ? ((List<Item>)baitsList.GetValue(fgui))[bi]?.id : null;
+                Bot.Check("chose the bait", (baitId ?? "") == wantBait, baitId ?? "no bait");
+                int bait0 = baitId == null ? 0 : me.data.GetItemsCount(baitId);
+                // Hold E: the press leaves the bait choice, holding fills the distance bar, letting go casts.
+                // (The game ignores E until the key that opened fishing is released: retry if so.)
+                for (int i = 0; i < 4 && FishState() == FishingGUI.FishingState.BaitChoosing; i++)
+                {
+                    // The bar fills in 2 s; distance n is the n-th third of it.
+                    yield return FakeInput.Hold(GameKey.Interaction, wantDist == 1 ? 0.35f : wantDist == 2 ? 1.0f : 1.7f);
+                    yield return Bot.Wait(0.5f);
+                }
+                Bot.Step($"info after the cast: state={FishState()} energy={me.energy:F1}");
+                yield return Bot.WaitUntil("cast, waiting for a bite", () => FishState() == FishingGUI.FishingState.WaitingForBite ||
+                                                                           FishState() == FishingGUI.FishingState.WaitingForPulling, 5f);
+                Bot.Publish("fish_cast", "1");
+                yield return Bot.WaitUntil("a fish bites", () => FishState() == FishingGUI.FishingState.WaitingForPulling, 40f);
+                yield return FakeInput.Press(GameKey.MiniGameAction);
+                yield return Bot.WaitUntil("reeling in", () => FishState() == FishingGUI.FishingState.Pulling, 5f);
+                yield return Bot.Wait(2f);
+                var gui = GUIElements.me.fishing;
+                var fish = HarmonyLib.AccessTools.Field(typeof(FishingGUI), "_fish").GetValue(gui) as Item;
+                string fishId = fish?.id;
+                int fish0 = fishId == null ? 0 : me.data.GetItemsCount(fishId);
+                // The reel-in skill game: decide it as won.
+                if (FishState() == FishingGUI.FishingState.Pulling)
+                {
+                    HarmonyLib.AccessTools.Field(typeof(FishingGUI), "is_success_fishing").SetValue(gui, true);
+                    FishingChangeState.Invoke(gui, new object[] { FishingGUI.FishingState.TakingOut });
+                }
+                else if (gui.is_shown) gui.Hide();
+                float t0 = UnityEngine.Time.realtimeSinceStartup;
+                while (FishState() != FishingGUI.FishingState.None && UnityEngine.Time.realtimeSinceStartup - t0 < 6f) yield return null;
+                if (FishState() != FishingGUI.FishingState.None) { gui.taking_out_animation_finished = true; yield return Bot.Wait(0.5f); }
+                Bot.Check("fishing finished", FishState() == FishingGUI.FishingState.None && !gui.is_shown, $"state={FishState()}");
+                int fish1 = fishId == null ? 0 : me.data.GetItemsCount(fishId);
+                Bot.Check("caught a fish", fishId != null && fish1 == fish0 + 1, $"{fishId}: {fish0} -> {fish1}");
+                // A caught fish can itself be a bait: discount it.
+                int bait1 = baitId == null ? 0 : me.data.GetItemsCount(baitId) - (baitId == fishId ? 1 : 0);
+                if (baitId != null)
+                    Bot.Check("used one bait", bait1 == bait0 - 1, $"{baitId}: {bait0} -> {bait1}");
+                yield return Bot.WaitUntil("can move again", CanMove, 5f);
+                Bot.Publish("fish_done", fishId ?? "none");
+                Bot.Publish("known_fish_" + Plugin.Player, MainGame.me.save.known_fishes.Count.ToString());
+                yield return Bot.WaitRemote(Other, "fish_seen", "1", 30f);
+            }
+            else
+            {
+                yield return Bot.WaitUntil("fisher found a spot", () => Bot.Remote(fisher, "fish") != null, 30f);
+                if (Bot.Remote(fisher, "fish") == "none") yield break;
+                yield return Bot.WaitUntil("fisher cast", () => Bot.Remote(fisher, "fish_cast") != null, 30f);
+                yield return Bot.WaitUntil("partner is shown fishing here", () => RemoteFishers() > 0, 10f);
+                Bot.Check("I can still move while the partner fishes", CanMove());
+                yield return Bot.WaitUntil("fisher done", () => Bot.Remote(fisher, "fish_done") != null, 90f);
+                yield return Bot.WaitUntil("partner no longer shown fishing", () => RemoteFishers() == 0, 10f);
+                string fishId = Bot.Remote(fisher, "fish_done");
+                Bot.Check("the fish did not land in my bag", Items(me.data.inventory) == partnerBag0, $"before [{partnerBag0}] now [{Items(me.data.inventory)}]");
+                Bot.Step($"info known fishes here {MainGame.me.save.known_fishes.Count}, fisher {Bot.Remote(fisher, "known_fish_" + fisher)}");
+                Bot.Publish("fish_seen", "1");
             }
         }
 
