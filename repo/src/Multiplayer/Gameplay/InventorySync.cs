@@ -44,6 +44,13 @@ namespace GraveyardKeeperCoop.Multiplayer
         public static InventorySync Instance => _instance;
 
         private readonly Dictionary<ulong, uint> lastReceivedSequenceByOrigin = new Dictionary<ulong, uint>();
+
+        /// <summary>GKMP: a rejoining peer restarts its sequence from 0.</summary>
+        internal void ForgetPeerSequence(ulong peer)
+        {
+            if (lastReceivedSequenceByOrigin.Remove(peer))
+                CoopMod.Logger.LogInfo($"[InventorySync] Forgot the last sequence of {peer} (left)");
+        }
         private readonly Dictionary<string, string> hostBaselineWgoFingerprints = new Dictionary<string, string>();
         private readonly HashSet<string> locallyMutatedWgoKeys = new HashSet<string>();
         private readonly Dictionary<long, uint> chestRevisions = new Dictionary<long, uint>();
@@ -772,11 +779,11 @@ namespace GraveyardKeeperCoop.Multiplayer
         private void OnInventorySyncReceived(CSteamID senderID, byte[] payload)
         {
             if (!isSyncEnabled)
-                return;
+            { RxDebug("sync disabled"); return; }
 
             var onlineCoop = OnlineCoopManager.Instance;
             if (onlineCoop == null || !onlineCoop.IsOnlineCoopEnabled || !CanUseInventoryState())
-                return;
+            { RxDebug("inventory state unavailable"); return; }
 
             if (payload == null || payload.Length == 0 || payload.Length > MaxPayloadBytes)
                 return;
@@ -812,7 +819,7 @@ namespace GraveyardKeeperCoop.Multiplayer
             }
 
             if (!onlineCoop.IsHost && !IsExpectedHost(senderID))
-                return;
+            { RxDebug($"not the expected host: {senderID}"); return; }
 
             if (IsStaleSnapshot(snapshot))
                 return;
@@ -824,6 +831,7 @@ namespace GraveyardKeeperCoop.Multiplayer
             {
                 if (!onlineCoop.IsHost && HasPendingExplicitLocalChanges())
                 {
+                    RxDebug($"client has pending local changes ({locallyMutatedWgoKeys.Count} keys, immediate={hasPendingImmediateSend}); resending instead of applying");
                     SendLocalSnapshot(force: true);
                     return;
                 }
@@ -970,7 +978,10 @@ namespace GraveyardKeeperCoop.Multiplayer
             {
                 reason = "invalid item count";
             }
-            else if (expectedRevision != currentRevision ||
+            // GKMP: a client that (re)joined mid-game has not seen any revision of this
+            // chest yet (0); the content token alone decides then. Before, its first
+            // chest move after a rejoin was always rejected.
+            else if ((expectedRevision != currentRevision && expectedRevision != 0u) ||
                      !string.Equals(expectedToken, BuildChestRevisionToken(chest), StringComparison.Ordinal))
             {
                 reason = "container changed before the operation reached the host";
@@ -1376,11 +1387,29 @@ namespace GraveyardKeeperCoop.Multiplayer
             if (lastReceivedSequenceByOrigin.TryGetValue(snapshot.OriginSteamId, out lastSequence) &&
                 snapshot.Sequence <= lastSequence)
             {
+                if (Time.realtimeSinceStartup >= nextStaleLogAt)
+                {
+                    nextStaleLogAt = Time.realtimeSinceStartup + 5f;
+                    CoopMod.Logger.LogWarning(
+                        $"[InventorySync] Dropped stale snapshot from {snapshot.OriginSteamId}: " +
+                        $"sequence {snapshot.Sequence} <= last {lastSequence}");
+                }
                 return true;
             }
 
             lastReceivedSequenceByOrigin[snapshot.OriginSteamId] = snapshot.Sequence;
             return false;
+        }
+
+        private float nextStaleLogAt;
+        private float nextRxDebugAt;
+
+        private void RxDebug(string why)
+        {
+            if (Time.realtimeSinceStartup < nextRxDebugAt)
+                return;
+            nextRxDebugAt = Time.realtimeSinceStartup + 3f;
+            CoopMod.Logger.LogWarning("[InventorySync] Snapshot not applied: " + why);
         }
 
         private void RecordRemotePersonalInventory(
@@ -1575,6 +1604,15 @@ namespace GraveyardKeeperCoop.Multiplayer
                     out string baselineFingerprint);
                 bool explicitlyDirty =
                     locallyMutatedWgoKeys.Contains(cheap.Key);
+                // GKMP: a client only sends objects it has a host baseline for. Objects
+                // that become active around the client but were not active around the host
+                // when it sent its state never got one, so their changes were never sent.
+                // Take the current state as the baseline the first time they are seen.
+                if (!isHost && !hasBaseline && !explicitlyDirty && !fullSnapshot)
+                {
+                    hostBaselineWgoFingerprints[cheap.Key] = cheap.Fingerprint;
+                    continue;
+                }
                 bool fingerprintChanged =
                     hasBaseline && baselineFingerprint != cheap.Fingerprint;
                 bool changed = fullSnapshot ||
@@ -1836,14 +1874,23 @@ namespace GraveyardKeeperCoop.Multiplayer
                 // Use the WGORegistry's maintained snapshot (O(1)) instead of
                 // MainGame.me.GetListOfWorldObjects(), which calls FindObjectsOfType
                 // and scans the entire scene (~20k objects, ~100ms) on every call.
-                List<WorldGameObject> worldObjects = WGORegistry.Instance?.SnapshotAll()
-                                                      ?? MainGame.me?.GetListOfWorldObjects();
+                // GKMP: WorldMap.objs is the game's full object list. The registry snapshot
+                // came from FindObjectsOfType at load (active objects only), so a chest or
+                // vendor away from the load spot never synced; filter to active ones below.
+                List<WorldGameObject> worldObjects = WorldMap.objs != null && WorldMap.objs.Count > 0
+                    ? WorldMap.objs
+                    : WGORegistry.Instance?.SnapshotAll() ?? MainGame.me?.GetListOfWorldObjects();
                 if (worldObjects != null)
                 {
                     for (int i = 0; i < worldObjects.Count; i++)
                     {
                         WorldGameObject wgo = worldObjects[i];
-                        if (ShouldSyncWgo(wgo))
+                        // GKMP: the registry now lists every world object; capture only the
+                        // ones active around this player (the game deactivates the rest).
+                        // Each side still sends what changes near it, and the receiver
+                        // resolves the object through the full registry. Capturing all of
+                        // them made the join snapshot ~700 KB and stalled the channel.
+                        if (ShouldSyncWgo(wgo) && IsActiveNearPlayer(wgo))
                             EligibleWgoCache.Add(wgo);
                     }
                 }
@@ -1871,6 +1918,19 @@ namespace GraveyardKeeperCoop.Multiplayer
 
             entries.Sort((a, b) => string.CompareOrdinal(a.Key, b.Key));
             return entries;
+        }
+
+        private static bool IsActiveNearPlayer(WorldGameObject wgo)
+        {
+            try
+            {
+                return IsLocalPlayerWgo(wgo) ||
+                       (wgo.gameObject != null && wgo.gameObject.activeInHierarchy);
+            }
+            catch
+            {
+                return false;
+            }
         }
 
         internal static void InvalidateEligibleWgoCache()
@@ -1960,7 +2020,9 @@ namespace GraveyardKeeperCoop.Multiplayer
                 // capacity, included so bag-size changes are detected.
                 sb.Append(item.id ?? string.Empty).Append(',')
                   .Append(item.value).Append(',')
-                  .Append(item.durability).Append(',')
+                  // GKMP: rounded, so slow decay (bodies rot on both sides on their own)
+                  // does not make every corpse look "changed" and echo back and forth.
+                  .Append(Math.Round(item.durability, 3)).Append(',')
                   .Append(item.hp).Append(',')
                   .Append(item.progress).Append(',')
                   .Append(item.money).Append(',')
@@ -2035,7 +2097,7 @@ namespace GraveyardKeeperCoop.Multiplayer
             }
             ItemOwnerCache.Remove(data);
 
-            List<WorldGameObject> worldObjects = WGORegistry.Instance?.SnapshotAll() ?? MainGame.me?.GetListOfWorldObjects();
+            List<WorldGameObject> worldObjects = WorldMap.objs != null && WorldMap.objs.Count > 0 ? WorldMap.objs : WGORegistry.Instance?.SnapshotAll() ?? MainGame.me?.GetListOfWorldObjects();
             if (worldObjects == null)
                 return null;
 

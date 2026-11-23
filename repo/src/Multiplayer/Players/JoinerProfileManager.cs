@@ -231,6 +231,7 @@ namespace GraveyardKeeperCoop.Multiplayer
                     parentSaveHash,
                     isBaseline);
                 profile.Save(path);
+                RememberLatestRevision(saveHash);
                 CoopMod.Logger.LogInfo(
                     $"[JoinerProfile] Committed saved personal state ({reason}, " +
                     $"slot='{hostSlot}', hash={ShortHash(saveHash)}, " +
@@ -297,8 +298,40 @@ namespace GraveyardKeeperCoop.Multiplayer
                 profile = null;
             }
 
+            // GKMP: the host saves again when it re-invites a friend who dropped out, so the
+            // rejoin loads a revision this joiner never committed. Carry the newest committed
+            // personal state forward to it instead of starting over with an empty bag.
+            string carriedFrom = null;
+            if (profile == null)
+            {
+                string latest = ReadLatestRevision();
+                if (!string.IsNullOrEmpty(latest) && latest != saveHash)
+                {
+                    JoinerProfile previous = JoinerProfile.LoadResilient(
+                        ResolveProfilePath(hostSlot, latest));
+                    if (previous != null && previous.IsBoundToRevision(latest))
+                    {
+                        profile = previous;
+                        carriedFrom = latest;
+                    }
+                }
+            }
+
             if (profile != null && profile.ApplyToLivePlayer())
             {
+                if (carriedFrom != null)
+                {
+                    CoopMod.Logger.LogInfo(
+                        $"[JoinerProfile] No snapshot for hash={ShortHash(saveHash)}; " +
+                        $"carried the newest committed state forward from {ShortHash(carriedFrom)}");
+                    activeSaveHash = saveHash;
+                    SaveLiveProfile(
+                        hostSlot,
+                        saveHash,
+                        "carried forward to a host save made while away",
+                        carriedFrom,
+                        false);
+                }
                 QuestSideEffectSync.ReconcileCurrentQuestEffects();
                 QuestSideEffectSync.ReconcileSucceededQuestEffects();
                 QuestSync.ReconcileCurrentTaskMilestones();
@@ -479,6 +512,45 @@ namespace GraveyardKeeperCoop.Multiplayer
             return Path.Combine(
                 Paths.ConfigPath,
                 $"gkcoop_joiner_inventory_{local}_{host.m_SteamID}_{worldSeed}");
+        }
+
+        private static string LatestRevisionPath()
+        {
+            string prefix = ResolveProfilePrefix();
+            return string.IsNullOrEmpty(prefix) ? null : prefix + "_latest.txt";
+        }
+
+        private static void RememberLatestRevision(string saveHash)
+        {
+            try
+            {
+                string path = LatestRevisionPath();
+                if (!string.IsNullOrEmpty(path))
+                    File.WriteAllText(path, saveHash ?? string.Empty);
+            }
+            catch (Exception ex)
+            {
+                CoopMod.Logger.LogWarning(
+                    $"[JoinerProfile] Could not remember the latest revision: {ex.Message}");
+            }
+        }
+
+        private static string ReadLatestRevision()
+        {
+            try
+            {
+                string path = LatestRevisionPath();
+                if (string.IsNullOrEmpty(path) || !File.Exists(path))
+                    return null;
+                string hash = File.ReadAllText(path).Trim().ToLowerInvariant();
+                return TryNormalizeSaveIdentity(string.Empty, hash, out _, out string normalized)
+                    ? normalized
+                    : null;
+            }
+            catch (Exception)
+            {
+                return null;
+            }
         }
 
         private static string ResolveProfilePath(string hostSlot, string saveHash)

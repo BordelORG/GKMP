@@ -44,6 +44,9 @@ namespace GraveyardKeeperCoop.Multiplayer
         public static PlayerParitySync Instance => _instance;
 
         private readonly Dictionary<ulong, uint> lastReceivedSequenceByOrigin = new Dictionary<ulong, uint>();
+
+        /// <summary>GKMP: a rejoining peer restarts its sequence from 0.</summary>
+        internal void ForgetPeerSequence(ulong peer) => lastReceivedSequenceByOrigin.Remove(peer);
         private readonly Dictionary<ulong, string> lastAppliedActionFingerprintByOrigin = new Dictionary<ulong, string>();
 
         private bool isSyncEnabled;

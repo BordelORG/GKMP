@@ -850,6 +850,10 @@ namespace GraveyardKeeperCoop.Network
             Multiplayer.CraftSync.Instance?.OnPeerLeftLobby(peer);
             Multiplayer.InventorySync.Instance?.OnPeerLeftLobby(peer);
             Multiplayer.FishingPresentationSync.Instance?.OnPeerLeftLobby(peer);
+            Multiplayer.SyncBehaviour.ForgetPeerSequences(peer.m_SteamID);
+            Multiplayer.InventorySync.Instance?.ForgetPeerSequence(peer.m_SteamID);
+            Multiplayer.WGOStateSync.Instance?.ForgetPeerSequence(peer.m_SteamID);
+            Multiplayer.PlayerParitySync.Instance?.ForgetPeerSequence(peer.m_SteamID);
             Reliable?.RemovePeer(peer);
             lastPacketRealtimeFrom.Remove(peer.m_SteamID);
             RemoveQueuedReliablePacketsFor(peer);

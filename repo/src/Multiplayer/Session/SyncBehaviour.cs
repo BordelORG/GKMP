@@ -87,6 +87,16 @@ namespace GraveyardKeeperCoop.Multiplayer
             CoopMod.Logger.LogInfo($"{LogPrefix} Sync enabled");
         }
 
+        /// <summary>
+        /// GKMP: a peer that leaves and rejoins starts its sequence from 0 again; forget
+        /// its last sequence so its new packets are not dropped as stale.
+        /// </summary>
+        public static void ForgetPeerSequences(ulong peer)
+        {
+            foreach (var inst in _instances.Values)
+                inst?._lastReceivedSequenceByOrigin.Remove(peer);
+        }
+
         public void DisableSync()
         {
             IsSyncEnabled = false;

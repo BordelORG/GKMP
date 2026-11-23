@@ -78,6 +78,9 @@ namespace GraveyardKeeperCoop.Multiplayer
         }
 
         private readonly Dictionary<ulong, uint> lastReceivedSequenceByOrigin = new Dictionary<ulong, uint>();
+
+        /// <summary>GKMP: a rejoining peer restarts its sequence from 0.</summary>
+        internal void ForgetPeerSequence(ulong peer) => lastReceivedSequenceByOrigin.Remove(peer);
         private readonly Dictionary<string, ulong> authoritativeFingerprints = new Dictionary<string, ulong>();
         private readonly Dictionary<string, ReceiveState> pendingReceives = new Dictionary<string, ReceiveState>();
 
