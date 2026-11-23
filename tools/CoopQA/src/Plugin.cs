@@ -45,6 +45,7 @@ namespace CoopQA
                 var h = new Harmony("aaa.coopqa");
                 SteamMock.Install(h, Broker, (ulong)welcome["id"], (string)welcome["name"]);
                 Diag.Install(h);
+                FakeInput.Install(h);
                 Bot.Start(this);
             }
             catch (Exception e)

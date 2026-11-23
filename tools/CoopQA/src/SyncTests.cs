@@ -34,6 +34,8 @@ namespace CoopQA
             new KeyValuePair<string, Func<IEnumerator>>("gather_client", () => Gather(gatherer: 2)),
             new KeyValuePair<string, Func<IEnumerator>>("combat_client", () => Combat(fighter: 2)),
             new KeyValuePair<string, Func<IEnumerator>>("combat_host", () => Combat(fighter: 1)),
+            new KeyValuePair<string, Func<IEnumerator>>("npc_talk_host", () => NpcTalk(talker: 1)),
+            new KeyValuePair<string, Func<IEnumerator>>("npc_talk_client", () => NpcTalk(talker: 2)),
             new KeyValuePair<string, Func<IEnumerator>>("sleep_rested_client", () => Sleep(clientTired: false, wakeWithKey: false)),
             new KeyValuePair<string, Func<IEnumerator>>("sleep_wake_with_key", () => Sleep(clientTired: true, wakeWithKey: true)),
             new KeyValuePair<string, Func<IEnumerator>>("time_after_sleep", Time),
@@ -726,6 +728,166 @@ namespace CoopQA
         private static string MyWorld() =>
             string.Join(";", WorldMap.objs.Where(w => w != null && w.unique_id > 0 && w.obj_id != null && w.obj_id.Contains("stump"))
                                           .Select(w => w.unique_id + ":" + w.obj_id).OrderBy(x => x).Take(50));
+
+
+        // ------------------------------------------------------------------ talking to NPCs
+        private static readonly List<string> bubblesSeen = new List<string>();
+        private static bool bubbleHookInstalled;
+
+        private static void InstallBubbleHook()
+        {
+            if (bubbleHookInstalled) return;
+            bubbleHookInstalled = true;
+            var m = HarmonyLib.AccessTools.Method(typeof(SpeechBubbleGUI), nameof(SpeechBubbleGUI.ShowMessage),
+                new[] { typeof(long), typeof(string), typeof(Transform), typeof(GJCommons.VoidDelegate), typeof(bool), typeof(bool),
+                        typeof(SpeechBubbleGUI.SpeechBubbleType), typeof(bool), typeof(SmartSpeechEngine.VoiceID) });
+            new HarmonyLib.Harmony("aaa.coopqa.bubbles").Patch(m, postfix: new HarmonyLib.HarmonyMethod(typeof(SyncTests), nameof(BubbleShown)));
+        }
+
+        private static void BubbleShown(long speaker_id, string txt, bool is_player)
+        {
+            var w = speaker_id > 0 ? WorldMap.GetWorldGameObjectByUniqueId(speaker_id, false) : null;
+            bubblesSeen.Add($"{(is_player ? "player" : w?.obj_id ?? speaker_id.ToString())}: {txt}");
+        }
+
+        private static SpeechBubbleGUI ActiveBubble() =>
+            SpeechBubbleGUI.all.Values.FirstOrDefault(b => b != null && b.gameObject.activeInHierarchy &&
+                                                           !(bool)HarmonyLib.AccessTools.Field(typeof(SpeechBubbleGUI), "_disappearing").GetValue(b));
+
+        private static List<MultiAnswerOptionGUI> OpenAnswers()
+        {
+            var cur = HarmonyLib.AccessTools.Field(typeof(MultiAnswerGUI), "_current").GetValue(null) as MultiAnswerGUI;
+            if (cur == null || !cur.gameObject.activeInHierarchy) return null;
+            var list = HarmonyLib.AccessTools.Field(typeof(MultiAnswerGUI), "_answers").GetValue(cur) as List<MultiAnswerOptionGUI>;
+            return list != null && list.Count > 0 && list.Any(a => a != null) ? list : null;
+        }
+
+        private static bool CanMove()
+        {
+            var pc = MainGame.me.player_char;
+            return !(bool)HarmonyLib.AccessTools.Method(typeof(BaseCharacterComponent), "PlayerControlIsDisabled").Invoke(pc, null);
+        }
+
+        /// <summary>One player walks up to an NPC and talks (E), clicks through the lines and
+        /// picks the first answer; the other stands next to them. Both must see the same lines,
+        /// and afterwards nobody may be stuck in a dialogue.</summary>
+        private static IEnumerator NpcTalk(int talker)
+        {
+            InstallBubbleHook();
+            var me = MainGame.me.player;
+            WorldGameObject npc;
+            if (Plugin.Player == talker)
+            {
+                var npcs = WorldMap.objs.Where(w => w != null && !w.is_player && w.unique_id > 0 && w.obj_def != null && w.obj_def.IsNPC() &&
+                                                    w.gameObject.activeInHierarchy && !string.IsNullOrEmpty(w.obj_def.attached_script))
+                                        .OrderBy(w => (w.pos - me.pos).sqrMagnitude).ToList();
+                Bot.Step("info NPCs: " + string.Join(",", npcs.Take(10).Select(w => $"{w.obj_id}#{w.unique_id}@{F((w.pos - me.pos).magnitude / 96f)}t")));
+                string prev = Bot.RemoteIn(1, "npc_talk_host", "npc");
+                npc = npcs.FirstOrDefault(w => prev == null || !prev.StartsWith(w.unique_id + "|")) ?? npcs.FirstOrDefault();
+                Bot.Check("found an NPC to talk to", npc != null);
+                if (npc == null) { Bot.Publish("npc", "none"); yield break; }
+                Bot.Publish("npc", $"{npc.unique_id}|{npc.obj_id}");
+            }
+            else
+            {
+                yield return Bot.WaitUntil("talker picked an NPC", () => Bot.Remote(talker, "npc") != null, 30f);
+                if (Bot.Remote(talker, "npc") == "none") yield break;
+                npc = WorldMap.GetWorldGameObjectByUniqueId(long.Parse(Bot.Remote(talker, "npc").Split('|')[0]), false);
+                Bot.Check("same NPC here", npc != null);
+                if (npc == null) { Bot.Publish("talk_done", "1"); yield break; }
+                me.PlaceAtPos(npc.pos + new Vector2(0f, -250f));   // stand close by
+            }
+            bubblesSeen.Clear();
+            yield return Bot.Sync("npc_ready");
+
+            if (Plugin.Player == talker)
+            {
+                yield return WalkUpTo(npc, 150f);
+                Bot.Step($"info nearest={me.components.interaction.nearest?.obj_id} npc={npc.obj_id}");
+                yield return FakeInput.Press(GameKey.Interaction);   // E
+                var choices = new List<string>();
+                float quiet = UnityEngine.Time.realtimeSinceStartup, t0 = quiet;
+                int presses = 0;
+                float lastNote = 0f, windowSince = -1f;
+                while (UnityEngine.Time.realtimeSinceStartup - quiet < 4f && UnityEngine.Time.realtimeSinceStartup - t0 < 60f)
+                {
+                    var answers = OpenAnswers();
+                    if (answers != null)
+                    {
+                        yield return Bot.Wait(0.8f);
+                        // Like a player: skip locked answers (price not affordable) and trading.
+                        var pickF = HarmonyLib.AccessTools.Field(typeof(MultiAnswerOptionGUI), "_can_be_picked");
+                        var dataF = HarmonyLib.AccessTools.Field(typeof(MultiAnswerOptionGUI), "_answer_data");
+                        var pickable = answers.Where(a => a != null && (bool)pickF.GetValue(a)).ToList();
+                        Func<MultiAnswerOptionGUI, string> idOf = a => (dataF.GetValue(a) as AnswerVisualData)?.id ?? "";
+                        // Ask each question once, then say goodbye.
+                        var first = pickable.FirstOrDefault(a => !idOf(a).Contains("trade") && idOf(a) != "Leave" && !choices.Contains(idOf(a)))
+                                    ?? pickable.FirstOrDefault(a => idOf(a) == "Leave")
+                                    ?? pickable.FirstOrDefault() ?? answers.First(a => a != null);
+                        var data = dataF.GetValue(first) as AnswerVisualData;
+                        choices.Add(data?.id ?? first.name);
+                        if (choices.Count <= 6)
+                            Bot.Step($"info answers offered: {string.Join(" / ", answers.Where(a => a != null).Select(a => (HarmonyLib.AccessTools.Field(typeof(MultiAnswerOptionGUI), "_answer_data").GetValue(a) as AnswerVisualData)?.id))} -> picking {data?.id}");
+                        first.OnChosen();   // clicking the first answer
+                        quiet = UnityEngine.Time.realtimeSinceStartup;
+                        yield return Bot.Wait(0.5f);
+                        continue;
+                    }
+                    if (ActiveBubble() != null)
+                    {
+                        yield return Bot.Wait(0.7f);
+                        yield return FakeInput.Press(GameKey.Select);   // click through the line
+                        presses++;
+                        quiet = UnityEngine.Time.realtimeSinceStartup;
+                        continue;
+                    }
+                    if (BaseGUI.opened_windows.Count == 0) windowSince = -1f;
+                    else if (windowSince < 0f) windowSince = UnityEngine.Time.realtimeSinceStartup;
+                    if (windowSince > 0f && UnityEngine.Time.realtimeSinceStartup - windowSince > 2f)
+                    {
+                        windowSince = -1f;
+                        Bot.Step("info closing window with Esc: " + string.Join(",", BaseGUI.opened_windows.Select(w => w.GetType().Name)));
+                        yield return FakeInput.Press(GameKey.Back);
+                        quiet = UnityEngine.Time.realtimeSinceStartup;
+                        continue;
+                    }
+                    if (!CanMove())
+                    {
+                        quiet = UnityEngine.Time.realtimeSinceStartup;   // a script is still running
+                        if (UnityEngine.Time.realtimeSinceStartup - lastNote > 5f)
+                        {
+                            lastNote = UnityEngine.Time.realtimeSinceStartup;
+                            var pc = MainGame.me.player_char;
+                            Bot.Step($"info cannot move: windows=[{string.Join(",", BaseGUI.opened_windows.Select(w => w.GetType().Name))}] control={pc.control_enabled} " +
+                                     $"building={MainGame.me.build_mode_logics.IsBuilding()} synced_dialogue={GraveyardKeeperCoop.Multiplayer.DialogueSync.Instance?.IsInSyncedDialogue} bubbles={SpeechBubbleGUI.all.Count}");
+                        }
+                    }
+                    yield return null;
+                }
+                Bot.Step($"info talk: {bubblesSeen.Count} lines, {presses} clicks, {choices.Count} choices");
+                foreach (var b in bubblesSeen.Take(12)) Bot.Step("     line " + b);
+                Bot.Step(bubblesSeen.Count > 0 ? "info the NPC talked" : "info the NPC had nothing to say (villager/guard)");
+                Bot.Publish("talk_done", string.Join("\u0001", bubblesSeen));
+            }
+            else
+            {
+                float t0 = UnityEngine.Time.realtimeSinceStartup;
+                while (Bot.Remote(talker, "talk_done") == null && UnityEngine.Time.realtimeSinceStartup - t0 < 80f) yield return null;
+                yield return Bot.Wait(2f);
+                var theirs = (Bot.Remote(talker, "talk_done") ?? "").Split('\u0001').Where(x => x.Length > 0).ToList();
+                Bot.Step($"info lines here {bubblesSeen.Count}, there {theirs.Count}");
+                foreach (var b in bubblesSeen.Take(12)) Bot.Step("     seen " + b);
+                Func<string, string> text = l => l.Substring(l.IndexOf(": ") + 2);
+                var mine = bubblesSeen.Select(text).ToList();
+                var missing = theirs.Select(text).Where(l => !mine.Contains(l)).ToList();
+                Bot.Check("saw the same conversation", missing.Count == 0, missing.Count == 0 ? "" : "missing: " + string.Join(" | ", missing.Take(5)));
+            }
+            yield return Bot.Sync("talk_over");
+            yield return Bot.WaitUntil("can move again after the conversation", CanMove, 5f);
+            var ds = GraveyardKeeperCoop.Multiplayer.DialogueSync.Instance;
+            Bot.Check("not stuck in a synced dialogue", ds == null || !ds.IsInSyncedDialogue);
+            Bot.Check("no answer menu left open", OpenAnswers() == null);
+        }
 
         // ------------------------------------------------------------------ gathering and combat
         private static readonly System.Reflection.MethodInfo OnChangeDirM =
