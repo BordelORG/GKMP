@@ -46,7 +46,10 @@ namespace GraveyardKeeperCoop.Patches
         private const float ClientDonkeyRequestTimeout = 8f;
         private const float NpcAnimationWindowTimeout = 120f;
         private const float CompletionSettleSeconds = 0.35f;
-        private const float CompletionMaxWaitSeconds = 20f;
+        // GKMP: was 20 s. NPCs on a daily routine (vendors, villagers) keep walking after a
+        // conversation, so the wait always hit the cap and the partner stayed locked for 20 s.
+        // NPC positions are synced continuously anyway; the partner still sees them walk.
+        private const float CompletionMaxWaitSeconds = 3f;
         private const string FirstDonkeyQuestId = "go_to_talk_with_donkey_first_time";
         private const string FirstDonkeyIntroEvent = "intro";
         private const string MetDonkeyPlayerParam = "met_donkey";
