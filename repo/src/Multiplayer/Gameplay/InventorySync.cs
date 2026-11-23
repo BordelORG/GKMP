@@ -1981,7 +1981,37 @@ namespace GraveyardKeeperCoop.Multiplayer
         /// </summary>
         private static string BuildCheapWgoFingerprint(WorldGameObject wgo, bool isLocalPlayerInventory)
         {
-            return BuildCheapItemFingerprint(wgo?.data);
+            string fingerprint = BuildCheapItemFingerprint(wgo?.data);
+            // GKMP: an object's own params (a grave's parts and decorations, a vendor's
+            // money) change without any item moving; include them so those changes are sent.
+            // Not for the player (energy, health and the like change all the time).
+            return isLocalPlayerInventory || wgo?.data == null
+                ? fingerprint
+                : fingerprint + "|p:" + BuildParamsFingerprint(wgo.data);
+        }
+
+        private static readonly System.Reflection.FieldInfo ItemParamsField =
+            HarmonyLib.AccessTools.Field(typeof(Item), "_params");
+        private static readonly System.Reflection.FieldInfo ResTypeField =
+            HarmonyLib.AccessTools.Field(typeof(GameRes), "_res_type");
+
+        private static string BuildParamsFingerprint(Item data)
+        {
+            try
+            {
+                var res = ItemParamsField?.GetValue(data) as GameRes;
+                var keys = res == null ? null : ResTypeField?.GetValue(res) as List<string>;
+                if (keys == null || keys.Count == 0)
+                    return string.Empty;
+                var sb = new StringBuilder(keys.Count * 16);
+                for (int i = 0; i < keys.Count; i++)
+                    sb.Append(keys[i]).Append('=').Append(Math.Round(res.Get(keys[i]), 2)).Append(',');
+                return sb.ToString();
+            }
+            catch
+            {
+                return string.Empty;
+            }
         }
 
         private static string BuildCheapItemFingerprint(Item data)
@@ -2026,10 +2056,31 @@ namespace GraveyardKeeperCoop.Multiplayer
                   .Append(item.hp).Append(',')
                   .Append(item.progress).Append(',')
                   .Append(item.money).Append(',')
-                  .Append(item.inventory_size).Append(';');
+                  .Append(item.inventory_size);
+                // GKMP: include what is inside (organs in a body, a surgeon's mistake), by id
+                // and count only. Nested changes used to be invisible to this fingerprint.
+                AppendNestedContents(sb, item.inventory, 0);
+                sb.Append(';');
             }
 
             sb.Append('}');
+        }
+
+        private static void AppendNestedContents(StringBuilder sb, List<Item> items, int depth)
+        {
+            if (items == null || items.Count == 0 || depth > 1)
+                return;
+            sb.Append('[');
+            for (int i = 0; i < items.Count; i++)
+            {
+                Item nested = items[i];
+                if (nested == null || nested.IsEmpty())
+                    continue;
+                sb.Append(nested.id).Append('x').Append(nested.value);
+                AppendNestedContents(sb, nested.inventory, depth + 1);
+                sb.Append(',');
+            }
+            sb.Append(']');
         }
 
         private static Dictionary<string, string> BuildCurrentWgoFingerprintMap()
@@ -2198,6 +2249,9 @@ namespace GraveyardKeeperCoop.Multiplayer
             return result;
         }
 
+        private static readonly System.Reflection.FieldInfo VendorCacheField =
+            HarmonyLib.AccessTools.Field(typeof(WorldGameObject), "_vendor");
+
         private static void ApplyWgoEntry(InventoryWgoEntry entry)
         {
             // Payload v2 peers may still send the legacy player:local entry. It is
@@ -2219,6 +2273,10 @@ namespace GraveyardKeeperCoop.Multiplayer
             item.secondary_inventory = DeserializeItemList(entry.SecondaryItemJsons);
 
             wgo.RestoreSavedInventory(item);
+            // GKMP: a vendor caches the data object it was built from. After the data is
+            // replaced, trades changed that detached copy: the stock never ran out and the
+            // change was never sent. Drop the cache so it is rebuilt on the new data.
+            VendorCacheField?.SetValue(wgo, null);
             try
             {
                 wgo.Redraw(true);
