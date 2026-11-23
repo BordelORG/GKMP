@@ -636,7 +636,7 @@ namespace CoopQA
                 // Stations worked from a dock point (graves): stand on the closest one, as the
                 // player's walk to it would end there (the start spot may have no path).
                 var docks = HarmonyLib.AccessTools.Field(typeof(WorldGameObject), "_dock_points").GetValue(station) as DockPoint[];
-                if (docks != null && docks.Length > 0)
+                if (docks != null && docks.Length > 0 && station.obj_def?.interaction_type == ObjectDefinition.InteractionType.Grave)
                 {
                     var dp = docks.Where(x => x != null).OrderBy(x => ((Vector2)x.transform.position - me.pos).sqrMagnitude).FirstOrDefault();
                     if (dp != null)
@@ -672,7 +672,18 @@ namespace CoopQA
                 Bot.Check("craft finished while working", !cc.is_crafting, $"after {UnityEngine.Time.realtimeSinceStartup - t0:F1}s");
                 yield return Bot.Wait(2f);
                 int got = haveOut() - outBefore + dropsAtStation() - dropsBefore;
-                if (outIds.Count > 0)
+                // An autopsy can fail (a surgeon's mistake destroys the organ): that is the game's
+                // own outcome, not a sync problem.
+                Func<string, int> mistakes = st =>
+                {
+                    var m = System.Text.RegularExpressions.Regex.Match(st, @"surgeon_mistakex(\d+)");
+                    return m.Success ? int.Parse(m.Groups[1].Value) : 0;
+                };
+                bool surgeonMistake = got == 0 && station.is_autopsy_table &&
+                                      mistakes(StationState(station)) > mistakes(stationBefore);
+                if (surgeonMistake)
+                    Bot.Step("info surgeon's mistake: the organ was destroyed (vanilla outcome)");
+                else if (outIds.Count > 0)
                     Bot.Check("crafted item received (inventory or ground)", got > 0, $"+{got}");
                 Bot.Step($"info station before [{stationBefore}] after [{StationState(station)}] params: {station.data.GetParam("quality", -1f)}");
                 Bot.Publish("craft_changed", StationState(station) != stationBefore || got > 0 ? "1" : "0");
@@ -833,7 +844,10 @@ namespace CoopQA
                 me = MainGame.me.player;
                 var after = PersonalState();
                 Bot.Step("info back with: " + string.Join(" ", after.Select(kv => kv.Key + "=" + kv.Value)));
-                Bot.Check("same day as the host", after["day"] == Bot.Remote(1, "host_day"), $"{after["day"]} vs {Bot.Remote(1, "host_day")}");
+                Bot.Publish("back", "1");
+                yield return Bot.WaitUntil("host told its day", () => Bot.Remote(1, "host_day_now") != null, 20f);
+                Bot.Check("same day as the host", MainGame.me.save.day.ToString() == Bot.Remote(1, "host_day_now"),
+                          $"{MainGame.me.save.day} vs {Bot.Remote(1, "host_day_now")}");
                 // By design the personal state is committed only with a host save (sleep), so what
                 // was picked up since then is rolled back on rejoin. Report it, do not fail on it.
                 Bot.Step(after["bag"] == before["bag"] && after["money"] == before["money"]
@@ -857,9 +871,10 @@ namespace CoopQA
                 me.PlaceAtPos(me.pos + new Vector2(96f, 0f));
                 yield return Bot.Wait(3f);
                 Bot.Check("host still in a lobby to invite into", SteamLobbyManager.Instance.IsInLobby);
-                Bot.Publish("host_day", MainGame.me.save.day.ToString());
                 Bot.Require("invite sent again", SteamLobbyManager.Instance.InviteFriend(new Steamworks.CSteamID(Bot.IdOf(2))));
-                yield return Bot.WaitUntil("friend rejoined", () => Bot.Remote(2, "rejoined") != null, 300f);
+                yield return Bot.WaitUntil("friend back in the game", () => Bot.Remote(2, "back") != null || Bot.Remote(2, "rejoined") != null, 300f);
+                Bot.Publish("host_day_now", MainGame.me.save.day.ToString());
+                yield return Bot.WaitUntil("friend rejoined", () => Bot.Remote(2, "rejoined") != null, 60f);
                 Bot.Check("friend is back in the game", Bot.Remote(2, "rejoined") == "1");
                 if (Bot.Remote(2, "rejoined") != "1") yield break;
                 yield return Bot.WaitUntil("host sees the friend again", () => ocm.RemotePlayerCount == 1, 30f);
