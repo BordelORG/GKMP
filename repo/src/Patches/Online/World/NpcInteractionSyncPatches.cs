@@ -246,6 +246,8 @@ namespace GraveyardKeeperCoop.Patches
                 localNpcInteractionStartedAt = Time.realtimeSinceStartup;
                 localNpcInteractionTag = tag;
                 localNpcInteractionObjId = objId;
+                localInteractionWatchForNoConversation = !isDonkey;
+                localInteractionHadPresentation = false;
 
                 if (isDonkey)
                 {
@@ -454,6 +456,8 @@ namespace GraveyardKeeperCoop.Patches
             localNpcInteractionStartedAt = Time.realtimeSinceStartup;
             localNpcInteractionTag = tag ?? "";
             localNpcInteractionObjId = objId ?? "";
+            localInteractionWatchForNoConversation = false;
+            localInteractionHadPresentation = false;
 
             try
             {
@@ -1453,8 +1457,43 @@ namespace GraveyardKeeperCoop.Patches
                 "waiting for enrolled actors to settle");
         }
 
+        // GKMP: pressing E on an NPC with nothing to say (villagers, guards) starts an
+        // interaction that never takes control away from the player, so the "control
+        // restored" completion never fires. The partner stayed locked as an observer and
+        // both stayed "in dialogue". End such an interaction when nothing appeared.
+        private static bool localInteractionWatchForNoConversation;
+        private static bool localInteractionHadPresentation;
+        private const float NoConversationSeconds = 2f;
+
+        private static void TickNoConversationWatchdog()
+        {
+            if (!isLocalNpcInteractionActive ||
+                !localInteractionWatchForNoConversation ||
+                localCompletionRequestedAt > 0f)
+                return;
+
+            bool presenting =
+                MainGame.me?.player_char?.control_enabled != true ||
+                !BaseGUI.all_guis_closed ||
+                (SpeechBubbleGUI.all != null && SpeechBubbleGUI.all.Count > 0) ||
+                IsMultiAnswerShown();
+            if (presenting)
+            {
+                localInteractionHadPresentation = true;
+                return;
+            }
+
+            if (!localInteractionHadPresentation &&
+                Time.realtimeSinceStartup - localNpcInteractionStartedAt >= NoConversationSeconds)
+            {
+                localInteractionWatchForNoConversation = false;
+                RequestLocalInteractionCompletion("the NPC had nothing to say");
+            }
+        }
+
         private static void TickPendingLocalInteractionCompletion()
         {
+            TickNoConversationWatchdog();
             if (!isLocalNpcInteractionActive ||
                 localCompletionRequestedAt <= 0f)
             {
@@ -1510,6 +1549,34 @@ namespace GraveyardKeeperCoop.Patches
             localNpcInteractionObjId = "";
             localCompletionRequestedAt = 0f;
             localCompletionSettledAt = 0f;
+
+            // GKMP: a plain conversation (speech bubbles and answers only) opens no
+            // BaseGUI, so the BaseGUI.Hide hook never ended the synced dialogue and both
+            // players stayed "in dialogue" afterwards. End it here once nothing of the
+            // conversation is left on screen; a window it opened (shop, ...) still ends
+            // it when that window closes.
+            var dialogueSync = GraveyardKeeperCoop.Multiplayer.DialogueSync.Instance;
+            if (dialogueSync != null &&
+                dialogueSync.IsInSyncedDialogue &&
+                BaseGUI.all_guis_closed &&
+                (SpeechBubbleGUI.all == null || SpeechBubbleGUI.all.Count == 0) &&
+                !IsMultiAnswerShown())
+            {
+                dialogueSync.NotifyDialogueEnd();
+            }
+        }
+
+        private static bool IsMultiAnswerShown()
+        {
+            try
+            {
+                var current = AccessTools.Field(typeof(MultiAnswerGUI), "_current")?.GetValue(null) as MultiAnswerGUI;
+                return current != null && current.gameObject.activeInHierarchy;
+            }
+            catch
+            {
+                return false;
+            }
         }
 
         [HarmonyPatch(typeof(GS), nameof(GS.SetPlayerEnable))]
