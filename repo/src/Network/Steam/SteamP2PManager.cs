@@ -851,6 +851,7 @@ namespace GraveyardKeeperCoop.Network
             Multiplayer.InventorySync.Instance?.OnPeerLeftLobby(peer);
             Multiplayer.FishingPresentationSync.Instance?.OnPeerLeftLobby(peer);
             Multiplayer.SyncBehaviour.ForgetPeerSequences(peer.m_SteamID);
+            Multiplayer.SaveTransferManager.ForgetPeer(peer.m_SteamID);
             Multiplayer.InventorySync.Instance?.ForgetPeerSequence(peer.m_SteamID);
             Multiplayer.WGOStateSync.Instance?.ForgetPeerSequence(peer.m_SteamID);
             Multiplayer.PlayerParitySync.Instance?.ForgetPeerSequence(peer.m_SteamID);

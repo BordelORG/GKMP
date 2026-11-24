@@ -556,9 +556,36 @@ namespace GraveyardKeeperCoop.Multiplayer
                    message.StartsWith(MSG_SAVE_CACHED);
         }
         
+        // GKMP: the client repeats its request every few seconds until the host answers,
+        // and the host first saves the game, so one join sent the whole save (3 MB) three
+        // times; the extra copies arrived while playing and clogged the connection. While a
+        // transfer to a player is being prepared or sent, further requests are ignored.
+        private const float DuplicateRequestWindowSeconds = 90f;
+        private static readonly Dictionary<ulong, float> transferStartedAt = new Dictionary<ulong, float>();
+
+        private static bool IsDuplicateSaveRequest(CSteamID clientID)
+        {
+            float now = Time.realtimeSinceStartup;
+            if (transferStartedAt.TryGetValue(clientID.m_SteamID, out float startedAt) &&
+                now - startedAt < DuplicateRequestWindowSeconds)
+            {
+                CoopMod.Logger.LogInfo(
+                    $"[SaveTransfer] Ignored a repeated save request from {clientID}: " +
+                    $"the transfer started {now - startedAt:F1}s ago");
+                return true;
+            }
+            transferStartedAt[clientID.m_SteamID] = now;
+            return false;
+        }
+
+        /// <summary>A player who left gets a fresh transfer when invited again.</summary>
+        public static void ForgetPeer(ulong peer) => transferStartedAt.Remove(peer);
+
         private static void HandleSaveRequest(CSteamID clientID)
         {
             CoopMod.Logger.LogInfo($"[SaveTransfer] Received save request from {clientID}");
+            if (IsDuplicateSaveRequest(clientID))
+                return;
             
             // First try the host's pre-set save slot, then fall back to active save
             SaveSlotData slotToSend = GetHostSlotToSend();
@@ -582,6 +609,8 @@ namespace GraveyardKeeperCoop.Multiplayer
         /// </summary>
         private static void HandleSaveRequestHashed(CSteamID clientID, string message)
         {
+            if (IsDuplicateSaveRequest(clientID))
+                return;
             string clientHash = string.Empty;
             int sep = message.IndexOf('|');
             if (sep >= 0 && sep < message.Length - 1)

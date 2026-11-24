@@ -1981,13 +1981,20 @@ namespace GraveyardKeeperCoop.Multiplayer
         /// </summary>
         private static string BuildCheapWgoFingerprint(WorldGameObject wgo, bool isLocalPlayerInventory)
         {
-            string fingerprint = BuildCheapItemFingerprint(wgo?.data);
+            return BuildDataFingerprint(wgo?.data, isLocalPlayerInventory);
+        }
+
+        /// <summary>The same fingerprint for an object's data here and for received data:
+        /// a mismatch made the receiver see a change after every update and send it back.</summary>
+        private static string BuildDataFingerprint(Item data, bool isLocalPlayerInventory)
+        {
+            string fingerprint = BuildCheapItemFingerprint(data);
             // GKMP: an object's own params (a grave's parts and decorations, a vendor's
             // money) change without any item moving; include them so those changes are sent.
             // Not for the player (energy, health and the like change all the time).
-            return isLocalPlayerInventory || wgo?.data == null
+            return isLocalPlayerInventory || data == null
                 ? fingerprint
-                : fingerprint + "|p:" + BuildParamsFingerprint(wgo.data);
+                : fingerprint + "|p:" + BuildParamsFingerprint(data);
         }
 
         private static readonly System.Reflection.FieldInfo ItemParamsField =
@@ -2003,9 +2010,17 @@ namespace GraveyardKeeperCoop.Multiplayer
                 var keys = res == null ? null : ResTypeField?.GetValue(res) as List<string>;
                 if (keys == null || keys.Count == 0)
                     return string.Empty;
+                // NPCs change walking params all the time (on_the_way, speed): for them only
+                // money counts (a vendor's purse), or their inventory is resent constantly.
+                bool npc = false;
+                try { npc = GameBalance.me?.GetDataOrNull<ObjectDefinition>(data.id)?.IsNPC() == true; } catch { }
                 var sb = new StringBuilder(keys.Count * 16);
                 for (int i = 0; i < keys.Count; i++)
+                {
+                    if (npc && keys[i] != "money")
+                        continue;
                     sb.Append(keys[i]).Append('=').Append(Math.Round(res.Get(keys[i]), 2)).Append(',');
+                }
                 return sb.ToString();
             }
             catch
@@ -3456,7 +3471,7 @@ namespace GraveyardKeeperCoop.Multiplayer
                 fingerprintItem.secondary_inventory =
                     DeserializeItemList(entry.SecondaryItemJsons);
             }
-            entry.Fingerprint = BuildCheapItemFingerprint(fingerprintItem);
+            entry.Fingerprint = BuildDataFingerprint(fingerprintItem, entry.IsLocalPlayerInventory);
             return entry;
         }
 
