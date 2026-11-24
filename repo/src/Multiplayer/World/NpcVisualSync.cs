@@ -35,6 +35,9 @@ namespace GraveyardKeeperCoop.Multiplayer
             public string LastSkinId = string.Empty;
             public int LastAnimatorStateHash;
             public string LastAnimatorFingerprint = string.Empty;
+            // Last value sent per animator parameter (by name hash); between full sends
+            // only the parameters that changed go out.
+            public readonly Dictionary<int, long> LastSentParameterValues = new Dictionary<int, long>();
             public bool LastCorpseDetached;
             public Vector3 LastVelocityPosition;
             public float LastVelocitySampleAt;
@@ -70,7 +73,8 @@ namespace GraveyardKeeperCoop.Multiplayer
             public uint PuppetEpoch;
         }
 
-        private const byte PayloadVersion = 7;
+        private const byte PayloadVersion = 8;
+        private static readonly int GlobalStateParameterHash = Animator.StringToHash("global_state");
         private const float BroadcastIntervalSeconds = 0.08f;
         private const float FullResendIntervalSeconds = 5f;
         private const float PositionThreshold = 0.25f;
@@ -909,7 +913,9 @@ namespace GraveyardKeeperCoop.Multiplayer
                 $"capture_max={diagnosticMaxCaptureMilliseconds:F1}ms " +
                 $"pack_serialize={TicksToMilliseconds(diagnosticPackSerializeTicks):F1}ms " +
                 $"send={TicksToMilliseconds(diagnosticSendTicks):F1}ms " +
-                $"total={TicksToMilliseconds(diagnosticTotalTicks):F1}ms");
+                $"total={TicksToMilliseconds(diagnosticTotalTicks):F1}ms " +
+                $"section_bytes=params:{diagnosticParamBytes},transforms:{diagnosticTransformBytes},sprites:{diagnosticSpriteBytes}");
+            diagnosticParamBytes = diagnosticTransformBytes = diagnosticSpriteBytes = 0L;
             ResetDiagnostics();
             nextDiagnosticReportAt = now + DiagnosticReportIntervalSeconds;
         }
@@ -1050,7 +1056,7 @@ namespace GraveyardKeeperCoop.Multiplayer
             if (entry?.AnimatorParameters != null)
             {
                 for (int i = 0; i < entry.AnimatorParameters.Count; i++)
-                    cost += 6 + EncodingByteCount(entry.AnimatorParameters[i].Name);
+                    cost += 9;
             }
 
             if (entry?.TransformActiveDeltas != null)
@@ -1203,7 +1209,8 @@ namespace GraveyardKeeperCoop.Multiplayer
                     AnimatorNormalizedTime = animatorNormalizedTime,
                     CorpseDetached = corpseDetached
                 };
-                entry.AnimatorParameters.AddRange(animatorParameters);
+                entry.AnimatorParameters.AddRange(
+                    ChangedParameters(state, animatorParameters, fullSend));
                 entry.TransformActiveDeltas.AddRange(
                     transformActiveDeltas);
                 entry.SpriteDeltas.AddRange(deltas);
@@ -1442,6 +1449,39 @@ namespace GraveyardKeeperCoop.Multiplayer
             return velocity;
         }
 
+        private static long ParameterValueKey(AnimatorParameterEntry p)
+        {
+            switch (p.Type)
+            {
+                case AnimatorParameterEntry.FloatType:
+                    return BitConverter.ToInt32(BitConverter.GetBytes(p.FloatValue), 0);
+                case AnimatorParameterEntry.IntType:
+                    return p.IntValue;
+                default:
+                    return p.BoolValue ? 1L : 0L;
+            }
+        }
+
+        private static List<AnimatorParameterEntry> ChangedParameters(
+            SourceState state,
+            List<AnimatorParameterEntry> parameters,
+            bool fullSend)
+        {
+            var changed = fullSend ? parameters : new List<AnimatorParameterEntry>();
+            for (int i = 0; i < parameters.Count; i++)
+            {
+                AnimatorParameterEntry p = parameters[i];
+                long value = ParameterValueKey(p);
+                if (!fullSend &&
+                    (!state.LastSentParameterValues.TryGetValue(p.NameHash, out long last) || last != value))
+                {
+                    changed.Add(p);
+                }
+                state.LastSentParameterValues[p.NameHash] = value;
+            }
+            return changed;
+        }
+
         private static List<AnimatorParameterEntry> CaptureAnimatorParameters(
             Animator animator,
             out int stateHash,
@@ -1487,7 +1527,8 @@ namespace GraveyardKeeperCoop.Multiplayer
                         parameters[i];
                     var entry = new AnimatorParameterEntry
                     {
-                        Name = parameter.name ?? string.Empty
+                        Name = parameter.name ?? string.Empty,
+                        NameHash = parameter.nameHash
                     };
 
                     switch (parameter.type)
@@ -1899,24 +1940,21 @@ namespace GraveyardKeeperCoop.Multiplayer
                     {
                         AnimatorParameterEntry parameter =
                             entry.AnimatorParameters[i];
-                        if (parameter == null ||
-                            string.IsNullOrEmpty(parameter.Name))
-                        {
+                        if (parameter == null || parameter.NameHash == 0)
                             continue;
-                        }
 
                         switch (parameter.Type)
                         {
                             case AnimatorParameterEntry.FloatType:
                                 animator.SetFloat(
-                                    parameter.Name,
+                                    parameter.NameHash,
                                     parameter.FloatValue);
                                 break;
                             case AnimatorParameterEntry.IntType:
                                 animator.SetInteger(
-                                    parameter.Name,
+                                    parameter.NameHash,
                                     parameter.IntValue);
-                                if (parameter.Name == "global_state")
+                                if (parameter.NameHash == GlobalStateParameterHash)
                                 {
                                     wgo.components.character
                                         .DeserializeGlobalState(
@@ -1925,7 +1963,7 @@ namespace GraveyardKeeperCoop.Multiplayer
                                 break;
                             case AnimatorParameterEntry.BoolType:
                                 animator.SetBool(
-                                    parameter.Name,
+                                    parameter.NameHash,
                                     parameter.BoolValue);
                                 break;
                         }
@@ -2095,6 +2133,11 @@ namespace GraveyardKeeperCoop.Multiplayer
             return spriteLibrary;
         }
 
+        // Bytes per entry section since the last report (diagnostics only).
+        private static long diagnosticParamBytes;
+        private static long diagnosticTransformBytes;
+        private static long diagnosticSpriteBytes;
+
         private static byte[] SerializePayload(
             uint sequence,
             float senderTime,
@@ -2127,6 +2170,7 @@ namespace GraveyardKeeperCoop.Multiplayer
                     writer.Write(entry.AnimatorStateHash);
                     writer.Write(entry.AnimatorNormalizedTime);
                     writer.Write(entry.CorpseDetached);
+                    long sectionStart = stream.Position;
                     writer.Write((ushort)Mathf.Min(
                         entry.AnimatorParameters.Count,
                         MaxAnimatorParametersPerNpc));
@@ -2137,7 +2181,7 @@ namespace GraveyardKeeperCoop.Multiplayer
                     {
                         AnimatorParameterEntry parameter =
                             entry.AnimatorParameters[j];
-                        writer.Write(parameter.Name ?? string.Empty);
+                        writer.Write(parameter.NameHash);
                         writer.Write(parameter.Type);
                         switch (parameter.Type)
                         {
@@ -2152,6 +2196,8 @@ namespace GraveyardKeeperCoop.Multiplayer
                                 break;
                         }
                     }
+                    diagnosticParamBytes += stream.Position - sectionStart;
+                    sectionStart = stream.Position;
                     writer.Write((ushort)Mathf.Min(
                         entry.TransformActiveDeltas.Count,
                         MaxTransformActiveDeltasPerNpc));
@@ -2164,9 +2210,12 @@ namespace GraveyardKeeperCoop.Multiplayer
                             entry.TransformActiveDeltas[j] ??
                             string.Empty);
                     }
+                    diagnosticTransformBytes += stream.Position - sectionStart;
+                    sectionStart = stream.Position;
                     writer.Write((ushort)Mathf.Min(entry.SpriteDeltas.Count, MaxSpriteDeltasPerNpc));
                     for (int j = 0; j < entry.SpriteDeltas.Count && j < MaxSpriteDeltasPerNpc; j++)
                         writer.Write(entry.SpriteDeltas[j] ?? string.Empty);
+                    diagnosticSpriteBytes += stream.Position - sectionStart;
                 }
                 writer.Flush();
                 return stream.ToArray();
@@ -2228,7 +2277,7 @@ namespace GraveyardKeeperCoop.Multiplayer
                             var parameter =
                                 new AnimatorParameterEntry
                                 {
-                                    Name = reader.ReadString(),
+                                    NameHash = reader.ReadInt32(),
                                     Type = reader.ReadByte()
                                 };
                             switch (parameter.Type)
@@ -2312,6 +2361,8 @@ namespace GraveyardKeeperCoop.Multiplayer
             public const byte BoolType = 2;
 
             public string Name;
+            // Sent instead of the name (Animator.StringToHash): names made up most of the traffic.
+            public int NameHash;
             public byte Type;
             public float FloatValue;
             public int IntValue;
