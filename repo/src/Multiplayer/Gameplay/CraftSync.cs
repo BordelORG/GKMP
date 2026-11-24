@@ -1756,6 +1756,12 @@ namespace GraveyardKeeperCoop.Multiplayer
                     cur_craft_items_used = new List<Item>()
                 };
 
+                // A world snapshot (WGOStateSync) captured before this change is applied over
+                // several frames and would set the old work state again (a finished grave part
+                // "working" once more). Hold snapshots off this object for a moment.
+                if (craft.is_crafting != entry.IsCrafting)
+                    WGOStateSync.NoteIdentityChange(wgo.unique_id);
+
                 isApplyingRemoteCraftState = true;
                 try
                 {
