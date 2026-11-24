@@ -330,6 +330,7 @@ namespace GraveyardKeeperCoop.Multiplayer
             if (!CheckSequence(reader, senderID)) return;
 
             int dungeonLevel = reader.ReadInt32();
+            GraveyardKeeperCoop.Patches.DungeonSyncPatches.OnHostGeneratesLevel(dungeonLevel);
             CoopMod.Logger.LogInfo($"{LogPrefix} Host entered dungeon level {dungeonLevel}");
         }
 

@@ -39,8 +39,17 @@ namespace CoopQA
         private static int dupNotes;
 
         /// <summary>An object listed twice in WorldMap: log who added it (first few times).</summary>
+        private static int strayNotes;
+
         private static void AddedTwice(WorldGameObject wgo)
         {
+            // A dungeon-id object registered outside the dungeon level: who made it (first few times).
+            if (wgo != null && wgo.unique_id >= 2000000000000L && strayNotes < 3 && MainGame.me?.dungeon_root != null &&
+                !wgo.transform.IsChildOf(MainGame.me.dungeon_root.transform))
+            {
+                strayNotes++;
+                Debug.Log($"[CoopQA] STRAY {wgo.obj_id}#{wgo.unique_id} parent={(wgo.transform.parent ? wgo.transform.parent.name : "-")}:\n{System.Environment.StackTrace}");
+            }
             if (wgo == null || dupNotes >= 3) return;
             var objs = ObjsF.GetValue(null) as List<WorldGameObject>;
             if (objs == null || objs.Count(o => o == wgo) < 2) return;

@@ -27,7 +27,8 @@ SAVE_SUBDIR = Path("xdg/unity3d/Lazy Bear Games/Graveyard Keeper")
 def real_saves_dir():
     flatpak = Path.home() / ".var/app/com.valvesoftware.Steam/.config/unity3d/Lazy Bear Games/Graveyard Keeper"
     native = Path.home() / ".config/unity3d/Lazy Bear Games/Graveyard Keeper"
-    for p in (flatpak, native, REAL_SAVES):
+    # qa/fixture: a kept copy, used when the real save is missing (e.g. moved by Steam Cloud)
+    for p in (flatpak, native, REAL_SAVES, QA / "fixture"):
         if (p / "1.dat").exists():
             return p
     return None

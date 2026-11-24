@@ -105,6 +105,9 @@ namespace GraveyardKeeperCoop.Patches
             if (string.IsNullOrEmpty(wgo.obj_id) || wgo.obj_id == "0") return;
             if (wgo.is_removed) return;
             if (MainGame.me?.world_root != null && !wgo.transform.IsChildOf(MainGame.me.world_root)) return;
+            // Every peer generates the dungeon level itself with the same ids (DungeonSyncPatches).
+            // A host copy would land beside the partner's own object with the same id.
+            if (DungeonSyncPatches.IsDungeonUid(wgo.unique_id)) return;
 
             var sync = GraveyardKeeperCoop.Multiplayer.SpawnSync.Instance;
             if (sync == null) return;

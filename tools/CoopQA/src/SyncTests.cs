@@ -49,6 +49,7 @@ namespace CoopQA
             new KeyValuePair<string, Func<IEnumerator>>("build_host", () => Build(1)),
             new KeyValuePair<string, Func<IEnumerator>>("build_client", () => Build(2)),
             new KeyValuePair<string, Func<IEnumerator>>("dungeon", Dungeon),
+            new KeyValuePair<string, Func<IEnumerator>>("dungeon_combat", DungeonCombat),
             new KeyValuePair<string, Func<IEnumerator>>("sleep_rested_client", () => Sleep(clientTired: false, wakeWithKey: false)),
             new KeyValuePair<string, Func<IEnumerator>>("sleep_wake_with_key", () => Sleep(clientTired: true, wakeWithKey: true)),
             new KeyValuePair<string, Func<IEnumerator>>("time_after_sleep", Time),
@@ -1333,6 +1334,179 @@ namespace CoopQA
             }
         }
 
+        private static List<WorldGameObject> DungeonMobs()
+        {
+            var root = MainGame.me.dungeon_root;
+            if (root == null || !root.dungeon_is_loaded_now) return new List<WorldGameObject>();
+            return WorldMap.objs.Where(w => w != null && !w.is_removed && w.obj_def != null && w.hp > 0f &&
+                                            w.obj_def.type == ObjectDefinition.ObjType.Mob &&
+                                            w.transform.IsChildOf(root.transform)).ToList();
+        }
+
+        private static string MobList(IEnumerable<WorldGameObject> mobs) =>
+            string.Join(",", mobs.OrderBy(w => w.unique_id).Select(w => $"{w.obj_id}#{w.unique_id}@{V(w.pos)}"));
+
+        private static string MobKinds(IEnumerable<WorldGameObject> mobs) =>
+            string.Join(",", mobs.OrderBy(w => w.unique_id).Select(w => $"{w.obj_id}#{w.unique_id % 1000000}"));
+
+        /// <summary>The same monster on the other side: the same id, else the same kind nearest.</summary>
+        private static WorldGameObject MatchMob(string ann)
+        {
+            var p = ann.Split('|');
+            long uid = long.Parse(p[0]);
+            var same = WorldMap.GetWorldGameObjectByUniqueId(uid, false);
+            if (same != null && same.obj_id == p[1]) return same;
+            Vector2 at = ParseV(p[2]);
+            return DungeonMobs().Where(w => w.obj_id == p[1]).OrderBy(w => Vector2.Distance(w.pos, at)).FirstOrDefault();
+        }
+
+        /// <summary>Both players in a dungeon level see the same monsters; each kills one and
+        /// the other sees it die (and stay dead); then the host leads both out.</summary>
+        private static IEnumerator DungeonCombat()
+        {
+            var me = MainGame.me.player;
+            if (Bot.IsHost)
+            {
+                MainGame.me.TeleportToDungeonLevel(1);
+                yield return Bot.WaitUntil("in the dungeon", InDungeon, 15f);
+                yield return Bot.Wait(4f);
+                Bot.Publish("dmobs_in", "1");
+            }
+            else
+            {
+                yield return Bot.WaitUntil("host in the dungeon", () => Bot.Remote(1, "dmobs_in") != null, 60f);
+                yield return Bot.WaitUntil("taken along into the dungeon", InDungeon, 20f);
+                yield return Bot.Wait(4f);
+            }
+            var mobs = DungeonMobs();
+            Bot.Step($"info {mobs.Count} monsters here: {MobList(mobs)}");
+            {
+                var all = MainGame.me.dungeon_root.GetComponentsInChildren<WorldGameObject>(true)
+                    .Where(w => w != null && w.obj_def != null && w.obj_def.type == ObjectDefinition.ObjType.Mob).ToList();
+                Bot.Step($"info mob objects under the dungeon: {all.Count}; " + string.Join(",", all.Where(w => !mobs.Contains(w))
+                    .Select(w => $"{w.obj_id}#{w.unique_id % 1000000} hp={F(w.hp)} removed={w.is_removed} active={w.gameObject.activeInHierarchy} listed={WorldMap.objs.Contains(w)} dead={w.is_dead}")));
+                // Live objects with a dungeon id that are not part of the current level (left over from an earlier copy).
+                var reg = GraveyardKeeperCoop.Multiplayer.WGORegistry.Instance?.SnapshotAll() ?? new List<WorldGameObject>();
+                var stale = reg.Concat(WorldMap.objs).Where(w => w != null && w.unique_id >= 2000000000000L &&
+                                                                 !w.transform.IsChildOf(MainGame.me.dungeon_root.transform)).Distinct().ToList();
+                Bot.Step($"info stale dungeon-id objects: {stale.Count}; " + string.Join(",", stale.Take(10)
+                    .Select(w => $"{w.obj_id}#{w.unique_id % 1000000} parent={(w.transform.parent ? w.transform.parent.name : "-")} active={w.gameObject.activeInHierarchy}")));
+            }
+            Bot.Publish("dmobs", MobKinds(mobs));
+            yield return Bot.WaitUntil("partner's monsters", () => Bot.Remote(Other, "dmobs") != null, 30f);
+            Bot.Check("the same monsters (kind and id) on both sides", MobKinds(mobs) == Bot.Remote(Other, "dmobs"),
+                      $"here [{MobKinds(mobs)}] there [{Bot.Remote(Other, "dmobs")}]");
+
+            // The client kills one first, then the host kills another.
+            foreach (int fighter in new[] { 2, 1 })
+            {
+                string key = "dkill" + fighter;
+                if (Plugin.Player == fighter)
+                {
+                    var target = DungeonMobs().OrderBy(w => (w.pos - me.pos).sqrMagnitude).FirstOrDefault();
+                    Bot.Check("a monster to fight", target != null);
+                    if (target == null) { Bot.Publish(key, "none"); continue; }
+                    string ann = $"{target.unique_id}|{target.obj_id}|{V(target.pos)}";
+                    Bot.Publish(key, ann);
+                    yield return Bot.WaitUntil("partner found it", () => Bot.Remote(Other, key + "_found") != null, 20f);
+                    yield return Fight(target.unique_id, target.obj_id, 60f);
+                    yield return StaysGone(target.unique_id, target.obj_id, 4f);
+                    Bot.Publish(key + "_done", "1");
+                    yield return Bot.WaitUntil("partner saw it die", () => Bot.Remote(Other, key + "_seen") != null, 40f);
+                }
+                else
+                {
+                    yield return Bot.WaitUntil("partner picked a monster", () => Bot.Remote(fighter, key) != null, 30f);
+                    string ann = Bot.Remote(fighter, key);
+                    if (ann == "none") continue;
+                    var m = MatchMob(ann);
+                    Bot.Check("the partner's monster exists here", m != null, ann + " | here: " + MobList(DungeonMobs()));
+                    Bot.Step($"info partner fights {ann}; here {(m == null ? "none" : $"{m.obj_id}#{m.unique_id}@{V(m.pos)} hp={F(m.hp)}")}");
+                    Bot.Publish(key + "_found", "1");
+                    if (m == null) { Bot.Publish(key + "_seen", "1"); continue; }
+                    long uid = m.unique_id; string id = m.obj_id; float hp0 = m.hp, minHp = hp0;
+                    float t0 = UnityEngine.Time.realtimeSinceStartup;
+                    while (Bot.Remote(fighter, key + "_done") == null && UnityEngine.Time.realtimeSinceStartup - t0 < 75f)
+                    {
+                        var w = WorldMap.GetWorldGameObjectByUniqueId(uid, false);
+                        if (w != null && !w.is_removed) minHp = Mathf.Min(minHp, w.hp);
+                        // Standing idle among monsters: do not let them kill the waiting player (a death
+                        // takes the player home and reloads the level, which is a different test).
+                        if (MainGame.me.player.hp < 60f) MainGame.me.player.hp = 100f;
+                        yield return null;
+                    }
+                    Bot.Step($"info monster hp here: {F(hp0)} -> min {F(minHp)}; now {Describe(uid)}");
+                    Bot.Check("saw the monster take damage", minHp < hp0 || Gone(uid, id));
+                    yield return Bot.WaitUntil("the monster died here too", () => Gone(uid, id), 10f);
+                    yield return StaysGone(uid, id, 4f);
+                    Bot.Publish(key + "_seen", "1");
+                }
+            }
+
+            mobs = DungeonMobs();
+            Bot.Publish("dmobs_after", MobKinds(mobs));
+            yield return Bot.WaitUntil("partner's monsters after", () => Bot.Remote(Other, "dmobs_after") != null, 30f);
+            yield return Bot.Wait(1f);
+            string mine = MobKinds(DungeonMobs());
+            Bot.Check("the same monsters left on both sides", mine == Bot.Remote(Other, "dmobs_after"),
+                      $"here [{mine}] there [{Bot.Remote(Other, "dmobs_after")}]");
+            if (mine != Bot.Remote(Other, "dmobs_after")) Bot.Step("info here: " + MobList(DungeonMobs()));
+
+            // The partner dies in the dungeon: the game takes them home and unloads the level, the
+            // coop mod loads the host's level again. The monsters killed before must stay dead.
+            if (Bot.IsHost)
+            {
+                yield return Bot.WaitRemote(2, "ddeath_back", "1", 120f);
+                Bot.Publish("dmobs_after2", MobKinds(DungeonMobs()));
+            }
+            else
+            {
+                // Not the first death: that one plays a scripted scene ("alive and back home") that
+                // holds the player for a while and is not what this checks.
+                if (MainGame.me.player.GetParamInt("deaths_count") < 3) MainGame.me.player.SetParam("deaths_count", 5f);
+                MainGame.me.player.hp = 0f;
+                MainGame.me.player.DoZeroHPActivity();
+                yield return Bot.WaitUntil("death message shown", () => GUIElements.me.dialog != null && GUIElements.me.dialog.is_shown, 10f);
+                yield return Bot.Wait(3f);
+                yield return FakeInput.Press(GameKey.Select);
+                yield return Bot.Wait(0.5f);
+                if (GUIElements.me.dialog.is_shown) { Bot.Step("info closing the death message directly"); GUIElements.me.dialog.Hide(); }
+                yield return Bot.WaitUntil("can move after dying", CanMove, 20f);
+                yield return Bot.WaitUntil("host's level loaded again", InDungeon, 30f);
+                yield return Bot.Wait(2f);
+                Bot.Publish("ddeath_back", "1");
+                yield return Bot.WaitUntil("host's monsters", () => Bot.Remote(1, "dmobs_after2") != null, 30f);
+                string now = MobKinds(DungeonMobs());
+                Bot.Check("after dying: the same monsters as the host", now == Bot.Remote(1, "dmobs_after2"),
+                          $"here [{now}] there [{Bot.Remote(1, "dmobs_after2")}]");
+            }
+
+            if (Bot.IsHost)
+            {
+                yield return Bot.WaitRemote(2, "dmobs_ready_out", "1", 30f);
+                var exit = WorldMap.objs.Where(w => w != null && !w.is_removed && w.obj_id == "dungeon_exit")
+                                        .OrderBy(w => (w.pos - me.pos).sqrMagnitude).FirstOrDefault();
+                Bot.Check("found the dungeon exit", exit != null);
+                if (exit != null)
+                {
+                    yield return WalkUpTo(exit, 120f);
+                    yield return FakeInput.Press(GameKey.Interaction);
+                    yield return Bot.WaitUntil("left the dungeon", () => !InDungeon(), 20f);
+                }
+                yield return Bot.WaitUntil("can move again", CanMove, 10f);
+                Bot.Publish("dmobs_out", "1");
+                yield return Bot.WaitRemote(2, "dmobs_done", "1", 60f);
+            }
+            else
+            {
+                Bot.Publish("dmobs_ready_out", "1");
+                yield return Bot.WaitUntil("host walked out", () => Bot.Remote(1, "dmobs_out") != null, 90f);
+                yield return Bot.WaitUntil("taken out of the dungeon too", () => !InDungeon(), 20f);
+                yield return Bot.WaitUntil("can move again", CanMove, 10f);
+                Bot.Publish("dmobs_done", "1");
+            }
+        }
+
         // ------------------------------------------------------------------ building
         private static readonly System.Reflection.FieldInfo GamepadActiveF = HarmonyLib.AccessTools.Field(typeof(LazyInput), "_gamepad_active");
         private static readonly System.Reflection.FieldInfo BuildModeF = HarmonyLib.AccessTools.Field(typeof(BuildModeLogics), "_mode");
@@ -1796,14 +1970,39 @@ namespace CoopQA
 
             if (Plugin.Player == fighter)
             {
+                yield return Fight(uid, id, 60f);
+                yield return StaysGone(uid, id, 4f);
+                Bot.Publish("fight_done", "1");
+            }
+            else
+            {
+                float minHp = hp0;
+                float t0 = UnityEngine.Time.realtimeSinceStartup;
+                while (Bot.Remote(fighter, "fight_done") == null && UnityEngine.Time.realtimeSinceStartup - t0 < 75f)
+                {
+                    var w = WorldMap.GetWorldGameObjectByUniqueId(uid, false);
+                    if (w != null && !w.is_removed) minHp = Mathf.Min(minHp, w.hp);
+                    yield return null;
+                }
+                Bot.Step($"info monster hp seen here: {F(hp0)} -> min {F(minHp)}; now {Describe(uid)}");
+                Bot.Check("saw the monster take damage", minHp < hp0 || Gone(uid, id));
+                yield return Bot.WaitUntil("monster dead here too", () => Gone(uid, id), 10f);
+                yield return StaysGone(uid, id, 4f);
+            }
+        }
+
+        /// <summary>Fight a monster like a player: keep close and side-on, face it, hold attack.</summary>
+        private static IEnumerator Fight(long uid, string id, float seconds)
+        {
+            {
                 var me = MainGame.me.player;
                 var sword = me.GetEquippedWeapon();
                 Bot.Step($"info weapon={sword?.id} hp={F(me.hp)} energy={F(me.energy)}");
                 float lastLog = 0f;
                 float t0 = UnityEngine.Time.realtimeSinceStartup;
-                while (!Gone(uid, id) && UnityEngine.Time.realtimeSinceStartup - t0 < 60f)
+                while (!Gone(uid, id) && UnityEngine.Time.realtimeSinceStartup - t0 < seconds)
                 {
-                    m = WorldMap.GetWorldGameObjectByUniqueId(uid, false);
+                    var m = WorldMap.GetWorldGameObjectByUniqueId(uid, false);
                     if (m == null) break;
                     Vector2 d = m.pos - (Vector2)me.pos;
                     Vector2 face = Mathf.Abs(d.x) > Mathf.Abs(d.y) ? new Vector2(Mathf.Sign(d.x), 0) : new Vector2(0, Mathf.Sign(d.y));
@@ -1824,23 +2023,6 @@ namespace CoopQA
                     yield return null;
                 }
                 Bot.Check($"killed the {id}", Gone(uid, id), $"after {UnityEngine.Time.realtimeSinceStartup - t0:F1}s now {Describe(uid)}");
-                yield return StaysGone(uid, id, 4f);
-                Bot.Publish("fight_done", "1");
-            }
-            else
-            {
-                float minHp = hp0;
-                float t0 = UnityEngine.Time.realtimeSinceStartup;
-                while (Bot.Remote(fighter, "fight_done") == null && UnityEngine.Time.realtimeSinceStartup - t0 < 75f)
-                {
-                    var w = WorldMap.GetWorldGameObjectByUniqueId(uid, false);
-                    if (w != null && !w.is_removed) minHp = Mathf.Min(minHp, w.hp);
-                    yield return null;
-                }
-                Bot.Step($"info monster hp seen here: {F(hp0)} -> min {F(minHp)}; now {Describe(uid)}");
-                Bot.Check("saw the monster take damage", minHp < hp0 || Gone(uid, id));
-                yield return Bot.WaitUntil("monster dead here too", () => Gone(uid, id), 10f);
-                yield return StaysGone(uid, id, 4f);
             }
         }
 
