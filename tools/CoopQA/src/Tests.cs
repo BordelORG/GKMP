@@ -127,6 +127,7 @@ namespace CoopQA
                 Bot.Scope = t.Key;
                 yield return Bot.Sync("begin:" + t.Key);
                 yield return t.Value();
+                Bot.KeepAlive = false;
                 Bot.Step("     " + Diag.Summary());
                 CloseLeftoverWindows();
                 yield return Bot.Sync("end:" + t.Key, 180f);

@@ -80,6 +80,9 @@ namespace CoopQA
         /// <summary>While true (session setup), a timeout ends the run; afterwards timeouts are soft.</summary>
         public static bool HardWaits = true;
 
+        /// <summary>While set, the local player is healed whenever its health drops low.</summary>
+        public static bool KeepAlive;
+
         public static IEnumerator WaitUntil(string what, Func<bool> cond, float timeout)
         {
             float t0 = Time.realtimeSinceStartup;

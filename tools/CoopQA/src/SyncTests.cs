@@ -48,6 +48,7 @@ namespace CoopQA
             new KeyValuePair<string, Func<IEnumerator>>("fishing_client", () => Fishing(2)),
             new KeyValuePair<string, Func<IEnumerator>>("build_host", () => Build(1)),
             new KeyValuePair<string, Func<IEnumerator>>("build_client", () => Build(2)),
+            new KeyValuePair<string, Func<IEnumerator>>("workers", Workers),
             new KeyValuePair<string, Func<IEnumerator>>("dungeon", Dungeon),
             new KeyValuePair<string, Func<IEnumerator>>("dungeon_combat", DungeonCombat),
             new KeyValuePair<string, Func<IEnumerator>>("sleep_rested_client", () => Sleep(clientTired: false, wakeWithKey: false)),
@@ -167,6 +168,94 @@ namespace CoopQA
             }
             Bot.Scope = "days";
             Bot.Check($"{days} days passed in one session", checkedDay >= startDay + days, $"day {startDay} -> {checkedDay}");
+        }
+
+        // ------------------------------------------------------------------ zombie workers
+        private static string WorkerInfo(WorldGameObject z) => z == null ? "none" :
+            $"{z.obj_id}#{z.unique_id} worker={(z.worker == null ? "none" : z.worker.worker_unique_id.ToString())} " +
+            $"bench={(z.linked_workbench == null ? "none" : z.linked_workbench.unique_id.ToString())} pos={V(z.pos)} " +
+            $"disabled={z.GetParamInt("is_disabled")} active={z.gameObject.activeInHierarchy}";
+
+        /// <summary>The host makes a zombie worker (as the game's Spawn New Worker node does), puts
+        /// it on a workbench and later sends it back to stock; the partner must see each step.</summary>
+        private static IEnumerator Workers()
+        {
+            var me = MainGame.me.player;
+            if (Bot.IsHost)
+            {
+                // Dock points are active only near the player: go to the nearest workbenches in turn.
+                var benches = WorldMap.objs.Where(w => w != null && !w.is_removed && w.obj_def != null && !w.obj_def.IsPorterStation() &&
+                                                       w.obj_def.has_craft && w.obj_def.interaction_type == ObjectDefinition.InteractionType.Craft &&
+                                                       w.unique_id < 2000000000000L && w.linked_worker == null)
+                                           .OrderBy(w => (w.pos - me.pos).sqrMagnitude).Take(6).ToList();
+                WorldGameObject bench = null;
+                foreach (var b in benches)
+                {
+                    if ((b.pos - me.pos).magnitude > 300f)
+                    {
+                        me.PlaceAtPos(b.pos + new Vector2(0f, -160f));
+                        yield return Bot.Wait(2f);
+                    }
+                    if (b.GetAvailableDockPointForZombie() != null) { bench = b; break; }
+                }
+                Bot.Check("a workbench for a zombie", bench != null);
+                if (bench == null) { Bot.Publish("zombie", "none"); yield break; }
+                // The zombie worker: the definition whose wgo is not the invisible helper.
+                Bot.Step("info worker definitions: " + string.Join(",", GameBalance.me.workers_data.Select(d => d.id + "->" + d.worker_wgo)));
+                var def = GameBalance.me.workers_data.FirstOrDefault(d => d.id.Contains("zombie")) ??
+                          GameBalance.me.workers_data.FirstOrDefault(d => d.id != "worker_invisible");
+                Bot.Check("worker definition", def != null);
+                if (def == null) { Bot.Publish("zombie", "none"); yield break; }
+                var z = WorldMap.SpawnWGO(MainGame.me.world_root, def.worker_wgo, (Vector3)(bench.pos + new Vector2(0f, -96f)));
+                var worker = MainGame.me.save.workers.CreateNewWorker(z, def.id, MainGame.me.save.GenerateBody(1, 3));
+                worker.UpdateWorkerLevel();
+                Bot.Step($"info made {WorkerInfo(z)} for bench {bench.obj_id}#{bench.unique_id}");
+                Bot.Publish("zombie", $"{z.unique_id}|{z.obj_id}|{worker.worker_unique_id}|{bench.unique_id}");
+                yield return Bot.WaitRemote(2, "zombie_seen", "1", 60f);
+
+                var dock = bench.GetAvailableDockPointForZombie();
+                z.transform.position = dock.transform.position;
+                z.RefreshPositionCache();
+                bench.linked_worker = z;
+                z.SetParam("is_disabled", 0f);
+                Bot.Step($"info on the bench: {WorkerInfo(z)}");
+                Bot.Publish("zombie_on_bench", V(z.pos));
+                yield return Bot.WaitRemote(2, "zombie_bench_seen", "1", 60f);
+
+                string err = WorldMap.RemoveZombieWorkerToStock(z);
+                Bot.Check("worker sent to stock", string.IsNullOrEmpty(err), err);
+                Bot.Step($"info in stock: {WorkerInfo(z)}");
+                Bot.Publish("zombie_stock", V(z.pos));
+                yield return Bot.WaitRemote(2, "zombie_stock_seen", "1", 60f);
+            }
+            else
+            {
+                yield return Bot.WaitUntil("host made a zombie", () => Bot.Remote(1, "zombie") != null, 60f);
+                var p = Bot.Remote(1, "zombie").Split('|');
+                if (p[0] == "none") yield break;
+                long zid = long.Parse(p[0]), wid = long.Parse(p[2]), bid = long.Parse(p[3]);
+                WorldGameObject Z() => WorldMap.GetWorldGameObjectByUniqueId(zid, false);
+                yield return Bot.WaitUntil("the zombie is here", () => Z() != null && !Z().is_removed, 30f);
+                Bot.Step("info here: " + WorkerInfo(Z()));
+                Bot.Check("same kind of zombie", Z() != null && Z().obj_id == p[1], WorkerInfo(Z()));
+                yield return Bot.WaitUntil("it is a worker here", () => Z()?.worker != null && Z().worker.worker_unique_id == wid, 20f);
+                Bot.Publish("zombie_seen", "1");
+
+                yield return Bot.WaitUntil("host put it on the bench", () => Bot.Remote(1, "zombie_on_bench") != null, 60f);
+                var bench = WorldMap.GetWorldGameObjectByUniqueId(bid, false);
+                Bot.Check("the bench is here", bench != null);
+                yield return Bot.WaitUntil("the bench has the zombie here", () => bench != null && bench.linked_worker != null && bench.linked_worker.unique_id == zid, 20f);
+                yield return Bot.WaitUntil("the zombie stands at the bench", () => Z() != null && Vector2.Distance(Z().pos, ParseV(Bot.Remote(1, "zombie_on_bench"))) < 40f, 20f);
+                Bot.Step("info on the bench here: " + WorkerInfo(Z()));
+                Bot.Publish("zombie_bench_seen", "1");
+
+                yield return Bot.WaitUntil("host sent it to stock", () => Bot.Remote(1, "zombie_stock") != null, 60f);
+                yield return Bot.WaitUntil("the bench is free here", () => bench == null || bench.linked_worker == null, 20f);
+                yield return Bot.WaitUntil("the zombie went to stock here", () => Z() == null || Vector2.Distance(Z().pos, ParseV(Bot.Remote(1, "zombie_stock"))) < 40f, 20f);
+                Bot.Check("the zombie is disabled here", Z() == null || Z().GetParamInt("is_disabled") == 1, WorkerInfo(Z()));
+                Bot.Step("info in stock here: " + WorkerInfo(Z()));
+                Bot.Publish("zombie_stock_seen", "1");
+            }
         }
 
         // ------------------------------------------------------------------ quests, NPC tasks, technologies
@@ -790,6 +879,13 @@ namespace CoopQA
                 var station = WorldMap.GetWorldGameObjectByUniqueId(long.Parse(p[0]), false);
                 Bot.Check("same station exists here", station?.components?.craft != null);
                 if (station?.components?.craft == null) { Bot.Publish("craft_seen", "1"); yield break; }
+                // Stand back: a partner next to the station picks up the crafter's output itself.
+                var obs = MainGame.me.player;
+                if (Vector2.Distance(obs.pos, station.pos) < 250f)
+                {
+                    obs.PlaceAtPos(station.pos + (obs.pos - station.pos).normalized * 300f + new Vector2(0f, -1f));
+                    Bot.Step("info stepped back from the station");
+                }
                 bool sawCrafting = false;
                 string sawCraft = null;
                 float t0 = UnityEngine.Time.realtimeSinceStartup;
@@ -1421,6 +1517,7 @@ namespace CoopQA
         /// the other sees it die (and stay dead); then the host leads both out.</summary>
         private static IEnumerator DungeonCombat()
         {
+            Bot.KeepAlive = true;   // off only for the planned death below; Suite resets it
             var me = MainGame.me.player;
             if (Bot.IsHost)
             {
@@ -1513,7 +1610,12 @@ namespace CoopQA
             // coop mod loads the host's level again. The monsters killed before must stay dead.
             if (Bot.IsHost)
             {
-                yield return Bot.WaitRemote(2, "ddeath_back", "1", 120f);
+                // Idle among the monsters while the partner dies and comes back: keep the host alive.
+                yield return Bot.WaitUntil("partner back after dying", () =>
+                {
+                    if (MainGame.me.player.hp < 60f) MainGame.me.player.hp = 100f;
+                    return Bot.Remote(2, "ddeath_back") == "1";
+                }, 120f);
                 Bot.Publish("dmobs_after2", MobKinds(DungeonMobs()));
             }
             else
@@ -1521,6 +1623,7 @@ namespace CoopQA
                 // Not the first death: that one plays a scripted scene ("alive and back home") that
                 // holds the player for a while and is not what this checks.
                 if (MainGame.me.player.GetParamInt("deaths_count") < 3) MainGame.me.player.SetParam("deaths_count", 5f);
+                Bot.KeepAlive = false;
                 MainGame.me.player.hp = 0f;
                 MainGame.me.player.DoZeroHPActivity();
                 yield return Bot.WaitUntil("death message shown", () => GUIElements.me.dialog != null && GUIElements.me.dialog.is_shown, 10f);
@@ -1529,6 +1632,7 @@ namespace CoopQA
                 yield return Bot.Wait(0.5f);
                 if (GUIElements.me.dialog.is_shown) { Bot.Step("info closing the death message directly"); GUIElements.me.dialog.Hide(); }
                 yield return Bot.WaitUntil("can move after dying", CanMove, 20f);
+                Bot.KeepAlive = true;
                 yield return Bot.WaitUntil("host's level loaded again", InDungeon, 30f);
                 yield return Bot.Wait(2f);
                 Bot.Publish("ddeath_back", "1");

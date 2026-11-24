@@ -66,6 +66,9 @@ namespace CoopQA
             if (UnityEngine.QualitySettings.vSyncCount != 0) UnityEngine.QualitySettings.vSyncCount = 0;
             if (UnityEngine.Application.targetFrameRate != 60) UnityEngine.Application.targetFrameRate = 60;
             SteamMock.Pump();
+            // Tests among monsters: the bot does not dodge, so keep its player alive.
+            if (Bot.KeepAlive && MainGame.me?.player != null && !MainGame.me.player.is_dead && MainGame.me.player.hp < 60f)
+                MainGame.me.player.hp = 100f;
             Bot.Tick();
         }
     }
