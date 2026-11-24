@@ -27,6 +27,8 @@ namespace CoopQA
                 prefix: new HarmonyMethod(typeof(Diag), nameof(Added)));
             h.Patch(AccessTools.Method(typeof(WorldMap), "OnAddNewWGO"),
                 postfix: new HarmonyMethod(typeof(Diag), nameof(AddedTwice)));
+            h.Patch(AccessTools.Method(typeof(CraftComponent), "DeserializeCraftComponent"),
+                postfix: new HarmonyMethod(typeof(Diag), nameof(CraftRestored)));
             h.Patch(AccessTools.Method(typeof(WorldMap), "OnDestroyWGO"),
                 prefix: new HarmonyMethod(typeof(Diag), nameof(Unlisted)));
             h.Patch(AccessTools.Method(typeof(OnlineCoopManager), "SnapRemotePlayerToNetworkPosition"),
@@ -44,6 +46,18 @@ namespace CoopQA
             if (objs == null || objs.Count(o => o == wgo) < 2) return;
             dupNotes++;
             Debug.Log($"[CoopQA] DUP {wgo.obj_id}#{wgo.unique_id} listed twice in WorldMap after OnAddNewWGO:\n{System.Environment.StackTrace}");
+        }
+
+        private static int craftNotes;
+
+        /// <summary>A grave's work state restored to "working": who did it (first few times).</summary>
+        private static void CraftRestored(CraftComponent __instance, SerializableWGO.SerializableCraft data)
+        {
+            var w = __instance?.wgo;
+            if (w == null || w.obj_id != "grave_ground" || !__instance.is_crafting || craftNotes >= 6) return;
+            craftNotes++;
+            Debug.Log($"[CoopQA] CRAFTSTATE {w.obj_id}#{w.unique_id} working craft={__instance.current_craft?.id} " +
+                      $"data.is_crafting={data.is_crafting} available={data.available}:\n{System.Environment.StackTrace}");
         }
 
         private static void Unlisted(WorldGameObject wgo)

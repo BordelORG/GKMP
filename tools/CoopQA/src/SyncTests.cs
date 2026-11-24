@@ -659,6 +659,9 @@ namespace CoopQA
                 Bot.Step("info before start: " + string.Join(",", craft.needs.Select(n => $"{n.id} {me.data.GetTotalCount(n.id, true)}/{n.value}")) +
                          $" craft tools=[{string.Join(",", craft.tool_actions.action_tools)}] station tools=[{string.Join(",", station.obj_def.tool_actions.action_tools)}]" +
                          $" belt=[{string.Join(",", me.data.secondary_inventory.Where(i => i != null && !i.IsEmpty()).Select(i => i.id + ":" + i.definition?.type))}]");
+                // The previous user's work must be over: a station still "working" makes the game
+                // continue that craft instead of starting the one the player chose.
+                yield return Bot.WaitUntil("station idle before I start", () => !cc.is_crafting, 10f);
                 bool started = start != null ? start(station, craft) : cc.CraftAsPlayer(craft);   // what clicking the recipe does
                 me.temp_do_work = true;   // holding the work key
                 Bot.Publish("craft", $"{station.unique_id}|{craft.id}|{string.Join(";", outIds)}");
@@ -666,6 +669,7 @@ namespace CoopQA
                 float s0 = UnityEngine.Time.realtimeSinceStartup;
                 yield return Bot.WaitUntil("craft running", () => cc.is_crafting, 8f);
                 Bot.Step($"info craft started={started} after {UnityEngine.Time.realtimeSinceStartup - s0:F2}s");
+                Bot.Check("the station works on my recipe", cc.current_craft?.id == craft.id, cc.current_craft?.id ?? "none");
                 float t0 = UnityEngine.Time.realtimeSinceStartup;
                 float lastLog = t0;
                 while (cc.is_crafting && UnityEngine.Time.realtimeSinceStartup - t0 < 60f)
@@ -711,7 +715,14 @@ namespace CoopQA
                 Bot.Step($"info station before [{stationBefore}] after [{StationState(station)}] params: {station.data.GetParam("quality", -1f)}");
                 Bot.Publish("craft_changed", StationState(station) != stationBefore || got > 0 ? "1" : "0");
                 Bot.Publish("craft_done", StationState(station));
-                yield return Bot.WaitRemote(Other, "craft_seen", "1", 40f);
+                // Keep the published state current: an update already on its way can still
+                // change the station here for a moment before the partner's echo arrives.
+                float pub0 = UnityEngine.Time.realtimeSinceStartup;
+                while (Bot.Remote(Other, "craft_seen") != "1" && UnityEngine.Time.realtimeSinceStartup - pub0 < 40f)
+                {
+                    yield return Bot.Wait(1f);
+                    Bot.Publish("craft_done", StationState(station));
+                }
             }
             else
             {
@@ -734,7 +745,8 @@ namespace CoopQA
                 yield return Bot.WaitUntil("station idle again here", () => !station.components.craft.is_crafting, 10f);
                 string theirs = Bot.Remote(crafter, "craft_done");
                 Bot.Check("the work changed the station", Bot.Remote(crafter, "craft_changed") != "0", "crafter saw no change");
-                yield return Bot.WaitUntil("station contents match the crafter's", () => StationState(station) == theirs, 10f);
+                yield return Bot.WaitUntil("station contents match the crafter's", () => StationState(station) == Bot.Remote(crafter, "craft_done"), 10f);
+                theirs = Bot.Remote(crafter, "craft_done");
                 Bot.Step($"info station here [{StationState(station)}] there [{theirs}]");
                 Bot.Publish("craft_seen", "1");
             }
