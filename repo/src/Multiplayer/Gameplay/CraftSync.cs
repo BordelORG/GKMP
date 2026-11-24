@@ -1760,6 +1760,16 @@ namespace GraveyardKeeperCoop.Multiplayer
                 try
                 {
                     craft.DeserializeCraftComponent(serializable);
+                    // GKMP: the game restores the work state only for an enabled component.
+                    // A grave's is disabled once a part is done, so "nothing in progress"
+                    // was ignored: the station kept working on the partner's finished part
+                    // and the next part the player chose continued that one instead.
+                    if (!entry.IsCrafting && (craft.is_crafting || craft.current_craft != null))
+                    {
+                        craft.is_crafting = false;
+                        craft.current_craft = null;
+                        try { wgo.OnCraftStateChanged(); } catch { }
+                    }
                     wgo.progress = Mathf.Clamp01(appliedProgress);
                     wgo.is_current_craft_gratitude =
                         entry.IsCurrentCraftGratitude;
