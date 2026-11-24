@@ -67,6 +67,7 @@ namespace CoopQA
             new KeyValuePair<string, Func<IEnumerator>>("resume_check", ResumeCheck),
             new KeyValuePair<string, Func<IEnumerator>>("morgue_probe", MorgueProbe),
             new KeyValuePair<string, Func<IEnumerator>>("dungeon_probe", DungeonProbe),
+            new KeyValuePair<string, Func<IEnumerator>>("days", Days),
         };
 
         private static int Other => Bot.IsHost ? 2 : 1;
@@ -110,6 +111,62 @@ namespace CoopQA
             Bot.Check("same day", otherDay == save.day, $"local={save.day} other={otherDay}");
             // A game day is ~22 real minutes; 0.01 of a day is ~13 s of drift.
             Bot.Check("time of day within 0.01", diff < 0.01f, $"local={F(TimeOfDay.me.time_of_day)} other={F(otherTod)} diff={F(diff)}");
+        }
+
+        // ------------------------------------------------------------------ several days in one session
+        /// <summary>Static world objects (no players, NPCs, monsters or dungeon objects) as
+        /// "obj_id@x,y" on a 32-unit grid; the same on both sides after any number of days.</summary>
+        private static HashSet<string> WorldDigest()
+        {
+            var set = new HashSet<string>();
+            foreach (var w in WorldMap.objs)
+            {
+                if (w == null || w.is_removed || w.is_player || w.obj_def == null || string.IsNullOrEmpty(w.obj_id)) continue;
+                if (w.obj_def.IsNPC() || w.obj_def.type == ObjectDefinition.ObjType.Mob) continue;
+                if (w.unique_id >= 2000000000000L || w.GetComponent<PlayerComponent>() != null) continue;
+                set.Add($"{w.obj_id}@{Mathf.RoundToInt(w.pos.x / 32f)},{Mathf.RoundToInt(w.pos.y / 32f)}");
+            }
+            return set;
+        }
+
+        private static IEnumerator Days()
+        {
+            // One sleep until rested moves the clock ~0.23 day; sleep until three days have passed
+            // and compare both sides at every new day.
+            const int days = 3;
+            int startDay = MainGame.me.save.day, checkedDay = startDay;
+            for (int sleep = 1; sleep <= 18 && checkedDay < startDay + days; sleep++)
+            {
+                Bot.Scope = "days_s" + sleep;   // fresh keys for the reused sleep/time/progress checks
+                Bot.Step($"info ---- sleep {sleep} (day {MainGame.me.save.day})");
+                yield return Sleep(clientTired: false, wakeWithKey: false);
+                yield return Bot.Sync("awake", 120f);
+                // Both sides decide on the host's day, so both run the same checks.
+                int day = MainGame.me.save.day;
+                if (Bot.IsHost) Bot.Publish("day", day.ToString());
+                else
+                {
+                    yield return Bot.WaitUntil("host's day", () => Bot.Remote(1, "day") != null, 30f);
+                    if (Bot.Remote(1, "day") != null) day = int.Parse(Bot.Remote(1, "day"));
+                }
+                if (day == checkedDay) continue;
+                checkedDay = day;
+                Bot.Step($"info ---- day {day}: compare both sides");
+                yield return Time();
+                yield return Progress();
+                yield return Bot.Wait(8f);   // let the world sync settle after waking
+                var mine = WorldDigest();
+                Bot.Publish("world", string.Join(";", mine.OrderBy(x => x, StringComparer.Ordinal)));
+                yield return Bot.WaitUntil("partner's world", () => Bot.Remote(Other, "world") != null, 60f);
+                var theirs = new HashSet<string>(Bot.Remote(Other, "world").Split(new[] { ';' }, StringSplitOptions.RemoveEmptyEntries));
+                var onlyMine = mine.Except(theirs).OrderBy(x => x, StringComparer.Ordinal).ToList();
+                var onlyTheirs = theirs.Except(mine).OrderBy(x => x, StringComparer.Ordinal).ToList();
+                Bot.Check($"day {day}: the same world objects ({mine.Count})", onlyMine.Count == 0 && onlyTheirs.Count == 0,
+                          $"only here {onlyMine.Count}: [{string.Join(" ", onlyMine.Take(12))}] only P{Other} {onlyTheirs.Count}: [{string.Join(" ", onlyTheirs.Take(12))}]");
+                yield return Bot.Sync("compared", 120f);
+            }
+            Bot.Scope = "days";
+            Bot.Check($"{days} days passed in one session", checkedDay >= startDay + days, $"day {startDay} -> {checkedDay}");
         }
 
         // ------------------------------------------------------------------ quests, NPC tasks, technologies
