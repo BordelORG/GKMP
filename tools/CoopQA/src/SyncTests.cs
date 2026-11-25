@@ -49,6 +49,7 @@ namespace CoopQA
             new KeyValuePair<string, Func<IEnumerator>>("build_host", () => Build(1)),
             new KeyValuePair<string, Func<IEnumerator>>("build_client", () => Build(2)),
             new KeyValuePair<string, Func<IEnumerator>>("workers", Workers),
+            new KeyValuePair<string, Func<IEnumerator>>("garden", Garden),
             new KeyValuePair<string, Func<IEnumerator>>("dungeon", Dungeon),
             new KeyValuePair<string, Func<IEnumerator>>("dungeon_combat", DungeonCombat),
             new KeyValuePair<string, Func<IEnumerator>>("dungeon_levels", DungeonLevels),
@@ -70,11 +71,129 @@ namespace CoopQA
             new KeyValuePair<string, Func<IEnumerator>>("morgue_probe", MorgueProbe),
             new KeyValuePair<string, Func<IEnumerator>>("dungeon_probe", DungeonProbe),
             new KeyValuePair<string, Func<IEnumerator>>("days", Days),
+            new KeyValuePair<string, Func<IEnumerator>>("garden_probe", GardenProbe),
             // Put first in a suite filter: the tests after it run through repeated 4 s link outages.
             new KeyValuePair<string, Func<IEnumerator>>("net_hiccups", NetHiccups),
         };
 
         private static int Other => Bot.IsHost ? 2 : 1;
+
+        private static IEnumerator GardenProbe()
+        {
+            if (!Bot.IsHost) yield break;
+            var me = MainGame.me.player;
+            var gardens = WorldMap.objs.Where(w => w != null && !w.is_removed && w.obj_id != null &&
+                                                   (w.obj_id.Contains("garden") || w.obj_id.Contains("bed_")))
+                                       .OrderBy(w => (w.pos - me.pos).sqrMagnitude).ToList();
+            Bot.Step("info garden objects: " + string.Join(",", gardens.GroupBy(w => w.obj_id).Select(g => g.Key + "x" + g.Count())));
+            foreach (var w in gardens.GroupBy(w => w.obj_id).Select(g => g.First()).Take(25))
+            {
+                var crafts = GameBalance.me.craft_data.Where(c => c != null && c.craft_in != null && c.craft_in.Contains(w.obj_id)).Take(8)
+                    .Select(c => $"{c.id}[needs {string.Join("+", c.needs.Select(n => n.id + "x" + n.value))} -> {string.Join("+", c.output.Select(o => o.id))} t={c.craft_time?.EvaluateFloat(w, me)} vis={MainGame.me.save.IsCraftVisible(c)}]");
+                var objc = GameBalance.me.craft_obj_data.Where(c => c != null && c.builder_ids != null && c.builder_ids.Contains(w.obj_id)).Take(4).Select(c => c.id);
+                Bot.Step($"info {w.obj_id}#{w.unique_id} @{V(w.pos)} dist={(w.pos - me.pos).magnitude / 96f:F0}t interaction={w.obj_def?.interaction_type} has_craft={w.obj_def?.has_craft} crafts: {string.Join(" ", crafts)} objcrafts: {string.Join(",", objc)}");
+            }
+            var seeds = GameBalance.me.items_data.Where(i => i.id.Contains("seed")).Select(i => i.id).Take(30);
+            Bot.Step("info seed items: " + string.Join(",", seeds));
+            Bot.Step("info bag: " + Items(me.data.inventory));
+        }
+
+        private static string GardenInfo(WorldGameObject w) => w == null ? "none" :
+            $"{w.obj_id}#{w.unique_id} crafting={w.components?.craft?.is_crafting} craft={w.components?.craft?.current_craft?.id} progress={F(w.progress)} hp={F(w.hp)}";
+
+        /// <summary>A garden bed through a season: the client plants wheat, the host sees it grow
+        /// (fast-forwarded on the host, which runs the world), both see it ripen, the client
+        /// harvests it and gets the crop, both see an empty bed again.</summary>
+        private static IEnumerator Garden()
+        {
+            var me = MainGame.me.player;
+            const string seed = "wheat_seed", plantCraft = "garden_wheat_planting_1";
+            Func<long, WorldGameObject> bed = uid => WorldMap.GetWorldGameObjectByUniqueId(uid, false);
+            if (!Bot.IsHost)
+            {
+                var craft = GameBalance.me.GetDataOrNull<CraftDefinition>(plantCraft);
+                var empty = WorldMap.objs.Where(w => w != null && !w.is_removed && w.obj_id == "garden_empty" && w.unique_id > 0 &&
+                                                     w.components?.craft != null && !w.components.craft.is_crafting)
+                                         .OrderBy(w => (w.pos - me.pos).sqrMagnitude).FirstOrDefault();
+                Bot.Check("an empty garden bed and the wheat recipe", empty != null && craft != null);
+                if (empty == null || craft == null) { Bot.Publish("bed", "none"); yield break; }
+                int need = craft.needs.First(n => n.id == seed).value;
+                me.data.AddItem(seed, need);   // stands in for seeds bought earlier
+                int seedsBefore = me.data.GetTotalCount(seed, true);
+                long uid = empty.unique_id;
+                Bot.Publish("bed", uid.ToString());
+                yield return WalkUpTo(empty);
+                Bot.Step($"info at the bed: nearest={me.components.interaction.nearest?.obj_id} {GardenInfo(empty)}");
+                bool started = empty.components.craft.CraftAsPlayer(craft);   // picking the seeds in the garden window
+                me.temp_do_work = true;
+                yield return Bot.WaitUntil("wheat planted", () => bed(uid)?.obj_id == "garden_wheat", 20f);
+                me.temp_do_work = false;
+                Bot.Step($"info planted (started={started}): {GardenInfo(bed(uid))}");
+                Bot.Check("the seeds left my bag", me.data.GetTotalCount(seed, true) == seedsBefore - need,
+                          $"{me.data.GetTotalCount(seed, true)} left of {seedsBefore}");
+                Bot.Publish("planted", "1");
+                yield return Bot.WaitRemote(1, "planted_seen", "1", 40f);
+
+                yield return Bot.WaitUntil("host grew it", () => Bot.Remote(1, "grown") != null, 90f);
+                yield return Bot.WaitUntil("ripe here too", () => bed(uid)?.obj_id == "garden_wheat_ready", 30f);
+                Bot.Step("info ripe: " + GardenInfo(bed(uid)) + $" tools=[{string.Join(",", bed(uid)?.obj_def?.tool_actions?.action_tools ?? new List<ItemDefinition.ItemType>())}] interaction={bed(uid)?.obj_def?.interaction_type}");
+
+                // Harvest: stand at it and work (the action key), like a player.
+                string[] crops = { "wheat", "wheat_seed" };
+                Func<int> have = () => crops.Sum(c => me.data.GetTotalCount(c, true));
+                Func<int> dropsNear = () => crops.Sum(c => Drops(c).Count(d => Vector2.Distance(d.transform.position, bed(uid)?.pos ?? me.pos) < 400f));
+                int haveBefore = have(), dropsBefore = dropsNear();
+                yield return WalkUpTo(bed(uid));
+                var ripe = bed(uid);
+                if (ripe != null && ripe.obj_def?.interaction_type != ObjectDefinition.InteractionType.None)
+                    ripe.Interact(me, interaction_start: true);
+                me.temp_do_work = true;
+                float h0 = UnityEngine.Time.realtimeSinceStartup;
+                while (bed(uid)?.obj_id == "garden_wheat_ready" && UnityEngine.Time.realtimeSinceStartup - h0 < 30f)
+                {
+                    if (me.energy < 10f) me.energy = 100f;
+                    yield return null;
+                }
+                me.temp_do_work = false;
+                Bot.Check("harvested", bed(uid)?.obj_id != "garden_wheat_ready", GardenInfo(bed(uid)));
+                yield return Bot.Wait(2f);
+                Bot.Step($"info after harvest: {GardenInfo(bed(uid))} bag+{have() - haveBefore} drops+{dropsNear() - dropsBefore}");
+                Bot.Check("got the crop (bag or ground)", have() - haveBefore + dropsNear() - dropsBefore > 0,
+                          $"bag [{Items(me.data.inventory)}]");
+                Bot.Publish("harvested", bed(uid)?.obj_id ?? "none");
+                yield return Bot.WaitRemote(1, "harvest_seen", "1", 40f);
+            }
+            else
+            {
+                yield return Bot.WaitUntil("client picked a bed", () => Bot.Remote(2, "bed") != null, 60f);
+                if (Bot.Remote(2, "bed") == "none") yield break;
+                long uid = long.Parse(Bot.Remote(2, "bed"));
+                yield return Bot.WaitUntil("client planted", () => Bot.Remote(2, "planted") != null, 60f);
+                yield return Bot.WaitUntil("wheat growing here", () => bed(uid)?.obj_id == "garden_wheat", 20f);
+                Bot.Step("info here: " + GardenInfo(bed(uid)));
+                Bot.Publish("planted_seen", "1");
+                // A day of growing, fast-forwarded: the host runs the growth.
+                var w = bed(uid);
+                yield return Bot.WaitUntil("it is growing", () => w != null && w.components.craft.is_crafting &&
+                                                                  (w.components.craft.current_craft?.id ?? "").EndsWith("_growing"), 20f);
+                Bot.Step("info growing: " + GardenInfo(w));
+                if (w != null) w.progress = 0.999f;
+                yield return Bot.WaitUntil("ripe here", () => bed(uid)?.obj_id == "garden_wheat_ready", 30f);
+                Bot.Publish("grown", "1");
+                Vector2 at = bed(uid)?.pos ?? me.pos;
+                Func<int> hostCrop = () => me.data.GetTotalCount("wheat_crop", true) +
+                                           Drops("wheat_crop").Count(d => Vector2.Distance(d.transform.position, at) < 400f);
+                int cropBefore = hostCrop();
+                yield return Bot.WaitUntil("client harvested", () => Bot.Remote(2, "harvested") != null, 90f);
+                string theirs = Bot.Remote(2, "harvested");
+                yield return Bot.WaitUntil("the bed looks the same here", () => (bed(uid)?.obj_id ?? "none") == theirs, 20f);
+                yield return Bot.Wait(2f);
+                Bot.Step("info after the client's harvest: " + GardenInfo(bed(uid)));
+                Bot.Check("the crop went only to the client (none here, none on the ground)", hostCrop() == cropBefore,
+                          $"{cropBefore} -> {hostCrop()}");
+                Bot.Publish("harvest_seen", "1");
+            }
+        }
 
         private static IEnumerator NetHiccups()
         {
