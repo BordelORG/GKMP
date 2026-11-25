@@ -117,6 +117,14 @@ namespace GraveyardKeeperCoop.Multiplayer
             new Dictionary<int, PendingHostWgoSpawn>();
         private readonly HashSet<int> sentCutsceneActorSpawns =
             new HashSet<int>();
+        // Host only: which client actor ("sender:requested uid") each canonical
+        // cutscene actor stands for. A crowd scene (sermon visitors) spawns
+        // several identical NPCs at one point; without this, the nearest-match
+        // fallback folds them all into the first one.
+        private readonly Dictionary<long, string> cutsceneActorClaims =
+            new Dictionary<long, string>();
+        private readonly Dictionary<string, long> cutsceneActorByRequest =
+            new Dictionary<string, long>();
         private readonly Dictionary<long, float> lastPuffFxRelayAt =
             new Dictionary<long, float>();
         private readonly Dictionary<long, float> lastBishopStockBroadcastAt =
@@ -193,6 +201,8 @@ namespace GraveyardKeeperCoop.Multiplayer
             pendingCutsceneActorSpawns.Clear();
             pendingHostWgoSpawns.Clear();
             sentCutsceneActorSpawns.Clear();
+            cutsceneActorClaims.Clear();
+            cutsceneActorByRequest.Clear();
             lastPuffFxRelayAt.Clear();
             lastBishopStockBroadcastAt.Clear();
             nextTemporaryPlacementId = TemporaryPlacementIdMax;
@@ -206,6 +216,8 @@ namespace GraveyardKeeperCoop.Multiplayer
             pendingCutsceneActorSpawns.Clear();
             pendingHostWgoSpawns.Clear();
             sentCutsceneActorSpawns.Clear();
+            cutsceneActorClaims.Clear();
+            cutsceneActorByRequest.Clear();
             lastPuffFxRelayAt.Clear();
             lastBishopStockBroadcastAt.Clear();
             nextTemporaryPlacementId = TemporaryPlacementIdMax;
@@ -2145,7 +2157,12 @@ namespace GraveyardKeeperCoop.Multiplayer
                 placement.GdPointTag,
                 placement.Active,
                 placement.RouteCompleted);
-            SteamP2PManager.Instance?.BroadcastSpawnSync(canonicalPayload);
+            // Not back to the sender: it already placed the NPC, and by the time the
+            // echo arrives its Flow has the NPC walking the next leg. Re-applying the
+            // old point would snap it back and clear its chunk movement flag, so it
+            // falls asleep outside the active chunks and never finishes its route
+            // (sermon visitors were left behind, still holding their donation).
+            SteamP2PManager.Instance?.BroadcastSpawnSync(canonicalPayload, senderID);
             NpcVisualSync.Instance?.BroadcastAuthoritativeStateNow(target);
 
             CoopMod.Logger.LogInfo(
@@ -2771,9 +2788,14 @@ namespace GraveyardKeeperCoop.Multiplayer
                 return;
             }
 
-            WorldGameObject existing = ResolveExistingCutsceneActor(
-                requestedUniqueId,
-                serialized);
+            string requestKey = senderID.m_SteamID + ":" + requestedUniqueId;
+            WorldGameObject existing = ResolveClaimedCutsceneActor(
+                requestKey,
+                serialized) ??
+                ResolveExistingCutsceneActor(
+                    requestedUniqueId,
+                    serialized,
+                    candidate => IsClaimedByOtherRequest(candidate, requestKey));
             long canonicalUniqueId = existing?.unique_id ??
                 AllocateCanonicalUniqueId();
             if (canonicalUniqueId <= 0L)
@@ -2791,6 +2813,7 @@ namespace GraveyardKeeperCoop.Multiplayer
                 active);
             if (actor == null)
                 return;
+            ClaimCutsceneActor(actor.unique_id, requestKey);
 
             BroadcastCanonicalCutsceneActorSpawn(
                 senderID.m_SteamID,
@@ -3000,9 +3023,57 @@ namespace GraveyardKeeperCoop.Multiplayer
             }
         }
 
+        private WorldGameObject ResolveClaimedCutsceneActor(
+            string requestKey,
+            SerializableWGO serialized)
+        {
+            if (!cutsceneActorByRequest.TryGetValue(requestKey, out long uid))
+                return null;
+            WorldGameObject claimed =
+                WorldMap.GetWorldGameObjectByUniqueId(uid, false);
+            return claimed != null && !claimed.is_removed &&
+                   string.Equals(claimed.obj_id, serialized.obj_id, StringComparison.Ordinal)
+                ? claimed
+                : null;
+        }
+
+        /// <summary>The candidate already stands for a different client actor that
+        /// is still alive on the host, so it cannot also be this one.</summary>
+        private bool IsClaimedByOtherRequest(
+            WorldGameObject candidate,
+            string requestKey)
+        {
+            return cutsceneActorClaims.TryGetValue(candidate.unique_id, out string owner) &&
+                   owner != requestKey;
+        }
+
+        private void ClaimCutsceneActor(long canonicalUniqueId, string requestKey)
+        {
+            if (cutsceneActorClaims.TryGetValue(canonicalUniqueId, out string previous) &&
+                previous != requestKey)
+            {
+                cutsceneActorByRequest.Remove(previous);
+            }
+            cutsceneActorClaims[canonicalUniqueId] = requestKey;
+            cutsceneActorByRequest[requestKey] = canonicalUniqueId;
+
+            if (cutsceneActorClaims.Count <= 256)
+                return;
+            // Forget actors that no longer exist (crowds leave and are destroyed).
+            foreach (long uid in new List<long>(cutsceneActorClaims.Keys))
+            {
+                WorldGameObject wgo = WorldMap.GetWorldGameObjectByUniqueId(uid, false);
+                if (wgo != null && !wgo.is_removed)
+                    continue;
+                cutsceneActorByRequest.Remove(cutsceneActorClaims[uid]);
+                cutsceneActorClaims.Remove(uid);
+            }
+        }
+
         private static WorldGameObject ResolveExistingCutsceneActor(
             long requestedUniqueId,
-            SerializableWGO serialized)
+            SerializableWGO serialized,
+            Func<WorldGameObject, bool> skip = null)
         {
             WorldGameObject exact =
                 WorldMap.GetWorldGameObjectByUniqueId(
@@ -3012,7 +3083,8 @@ namespace GraveyardKeeperCoop.Multiplayer
                 string.Equals(
                     exact.obj_id,
                     serialized.obj_id,
-                    StringComparison.Ordinal))
+                    StringComparison.Ordinal) &&
+                (skip == null || !skip(exact)))
             {
                 return exact;
             }
@@ -3044,7 +3116,8 @@ namespace GraveyardKeeperCoop.Multiplayer
             {
                 WorldGameObject candidate = candidates[i];
                 if (candidate == null || candidate.is_removed ||
-                    candidate.is_player)
+                    candidate.is_player ||
+                    (skip != null && skip(candidate)))
                 {
                     continue;
                 }

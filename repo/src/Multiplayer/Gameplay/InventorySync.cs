@@ -23,7 +23,7 @@ namespace GraveyardKeeperCoop.Multiplayer
     {
         public const string PersonalUseCapabilityKey = "puse";
         public const string PersonalUseCapabilityValue = "1";
-        private const byte PayloadVersion = 2;
+        private const byte PayloadVersion = 4;   // 3 is the chest payload
         private const byte ChestPayloadVersion = 3;
         private const byte ChestMoveRequest = 1;
         private const byte ChestMoveResult = 2;
@@ -53,6 +53,15 @@ namespace GraveyardKeeperCoop.Multiplayer
         }
         private readonly Dictionary<string, string> hostBaselineWgoFingerprints = new Dictionary<string, string>();
         private readonly HashSet<string> locallyMutatedWgoKeys = new HashSet<string>();
+        // Client only: the snapshot sequence in which each object was last sent. A host
+        // packet built before the host applied that send still carries the older state;
+        // applying it rolled back changes made in quick succession (sermon donations
+        // falling into the box one after another). Host packets say which client
+        // sequence they already include, so such entries are recognised and skipped.
+        private readonly Dictionary<string, KeyValuePair<uint, float>> inFlightWgoStates =
+            new Dictionary<string, KeyValuePair<uint, float>>();
+        // A host that never confirms (it dropped the packet) regains authority after this.
+        private const float InFlightWgoExpirySeconds = 10f;
         private readonly Dictionary<long, uint> chestRevisions = new Dictionary<long, uint>();
         private readonly Dictionary<uint, ChestMoveCapture> pendingChestMoves = new Dictionary<uint, ChestMoveCapture>();
         private readonly HashSet<string> processedChestOperations = new HashSet<string>();
@@ -173,6 +182,7 @@ namespace GraveyardKeeperCoop.Multiplayer
             lastSentFingerprint = string.Empty;
             hostBaselineWgoFingerprints.Clear();
             locallyMutatedWgoKeys.Clear();
+            inFlightWgoStates.Clear();
             chestRevisions.Clear();
             pendingChestMoves.Clear();
             processedChestOperations.Clear();
@@ -209,6 +219,7 @@ namespace GraveyardKeeperCoop.Multiplayer
             lastReceivedSequenceByOrigin.Clear();
             hostBaselineWgoFingerprints.Clear();
             locallyMutatedWgoKeys.Clear();
+            inFlightWgoStates.Clear();
             chestRevisions.Clear();
             pendingChestMoves.Clear();
             processedChestOperations.Clear();
@@ -699,6 +710,8 @@ namespace GraveyardKeeperCoop.Multiplayer
             }
 
             snapshot.Sequence = ++nextSequence;
+            if (onlineCoop.IsHost)
+                snapshot.AppliedSequences = new Dictionary<ulong, uint>(lastReceivedSequenceByOrigin);
 
             byte[] payload;
             long serializationStartedAt =
@@ -760,9 +773,16 @@ namespace GraveyardKeeperCoop.Multiplayer
                     sendTicks);
             }
 
+            float sentAt = Time.realtimeSinceStartup;
             for (int i = 0; i < snapshot.WgoEntries.Count; i++)
             {
-                locallyMutatedWgoKeys.Remove(snapshot.WgoEntries[i].Key);
+                InventoryWgoEntry sent = snapshot.WgoEntries[i];
+                locallyMutatedWgoKeys.Remove(sent.Key);
+                if (!onlineCoop.IsHost && !sent.IsLocalPlayerInventory)
+                {
+                    inFlightWgoStates[sent.Key] =
+                        new KeyValuePair<uint, float>(snapshot.Sequence, sentAt);
+                }
             }
 
             lastSentFingerprint = snapshot.Fingerprint;
@@ -1485,8 +1505,12 @@ namespace GraveyardKeeperCoop.Multiplayer
                 // never short-circuited anyway. RestoreSavedInventory is just a
                 // field assignment, so always applying is cheaper than running
                 // another full fingerprint pass to "save" one.
+                uint hostAppliedMine = 0U;
+                snapshot.AppliedSequences?.TryGetValue(GetLocalSteamId(), out hostAppliedMine);
                 for (int i = 0; i < snapshot.WgoEntries.Count; i++)
                 {
+                    if (IsOlderThanInFlightState(snapshot.WgoEntries[i], hostAppliedMine))
+                        continue;
                     ApplyWgoEntry(snapshot.WgoEntries[i]);
                 }
 
@@ -1502,6 +1526,24 @@ namespace GraveyardKeeperCoop.Multiplayer
             {
                 isApplyingRemote = false;
             }
+        }
+
+        private bool IsOlderThanInFlightState(InventoryWgoEntry entry, uint hostAppliedMine)
+        {
+            if (entry == null || inFlightWgoStates.Count == 0 ||
+                !inFlightWgoStates.TryGetValue(entry.Key, out var sent))
+            {
+                return false;
+            }
+            if (hostAppliedMine >= sent.Key ||
+                Time.realtimeSinceStartup - sent.Value > InFlightWgoExpirySeconds)
+            {
+                inFlightWgoStates.Remove(entry.Key);
+                return false;
+            }
+            RxDebug($"skipped host entry {entry.Key}: built before the host applied my " +
+                    $"sequence {sent.Key} (host has {hostAppliedMine})");
+            return true;
         }
 
         private void ApplyFirstHostSnapshotKeepingLocalChanges(InventorySnapshot snapshot)
@@ -3403,6 +3445,17 @@ namespace GraveyardKeeperCoop.Multiplayer
                     }
                 }
 
+                var applied = snapshot.AppliedSequences;
+                writer.Write(applied?.Count ?? 0);
+                if (applied != null)
+                {
+                    foreach (var kv in applied)
+                    {
+                        writer.Write(kv.Key);
+                        writer.Write(kv.Value);
+                    }
+                }
+
                 writer.Flush();
                 return stream.ToArray();
             }
@@ -3453,6 +3506,17 @@ namespace GraveyardKeeperCoop.Multiplayer
                     for (int i = 0; i < dropCount; i++)
                     {
                         snapshot.Drops.Add(ReadDropEntry(reader));
+                    }
+                }
+
+                int appliedCount = ReadSafeCount(reader, "applied sequence count", 64);
+                if (appliedCount > 0)
+                {
+                    snapshot.AppliedSequences = new Dictionary<ulong, uint>(appliedCount);
+                    for (int i = 0; i < appliedCount; i++)
+                    {
+                        ulong peer = reader.ReadUInt64();
+                        snapshot.AppliedSequences[peer] = reader.ReadUInt32();
                     }
                 }
 
@@ -3567,6 +3631,8 @@ namespace GraveyardKeeperCoop.Multiplayer
             public byte Version;
             public ulong OriginSteamId;
             public uint Sequence;
+            /// <summary>Host only: the last snapshot sequence applied from each client.</summary>
+            public Dictionary<ulong, uint> AppliedSequences;
             public bool IsFull;
             public bool HasToolbar;
             public bool HasDrops;

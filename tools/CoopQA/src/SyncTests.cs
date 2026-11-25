@@ -50,6 +50,7 @@ namespace CoopQA
             new KeyValuePair<string, Func<IEnumerator>>("build_client", () => Build(2)),
             new KeyValuePair<string, Func<IEnumerator>>("workers", Workers),
             new KeyValuePair<string, Func<IEnumerator>>("garden", Garden),
+            new KeyValuePair<string, Func<IEnumerator>>("sermon", Sermon),
             new KeyValuePair<string, Func<IEnumerator>>("dungeon", Dungeon),
             new KeyValuePair<string, Func<IEnumerator>>("dungeon_combat", DungeonCombat),
             new KeyValuePair<string, Func<IEnumerator>>("dungeon_levels", DungeonLevels),
@@ -72,6 +73,7 @@ namespace CoopQA
             new KeyValuePair<string, Func<IEnumerator>>("dungeon_probe", DungeonProbe),
             new KeyValuePair<string, Func<IEnumerator>>("days", Days),
             new KeyValuePair<string, Func<IEnumerator>>("garden_probe", GardenProbe),
+            new KeyValuePair<string, Func<IEnumerator>>("sermon_probe", SermonProbe),
             // Put first in a suite filter: the tests after it run through repeated 4 s link outages.
             new KeyValuePair<string, Func<IEnumerator>>("net_hiccups", NetHiccups),
         };
@@ -96,6 +98,160 @@ namespace CoopQA
             var seeds = GameBalance.me.items_data.Where(i => i.id.Contains("seed")).Select(i => i.id).Take(30);
             Bot.Step("info seed items: " + string.Join(",", seeds));
             Bot.Step("info bag: " + Items(me.data.inventory));
+        }
+
+        private static IEnumerator SermonProbe()
+        {
+            if (!Bot.IsHost) yield break;
+            var me = MainGame.me.player;
+            var pulpit = WorldMap.GetWorldGameObjectByCustomTag("church_pulpit");
+            Bot.Step($"info day={MainGame.me.save.day} dow={MainGame.me.save.day_of_week} church_level={me.GetParam("church_level")} prayed_this_week={me.GetParam("prayed_this_week")} faith={me.data.GetTotalCount("faith")} money={me.data.money}");
+            Bot.Step($"info pulpit: {(pulpit == null ? "none" : $"{pulpit.obj_id}#{pulpit.unique_id} @{V(pulpit.pos)} dist={(pulpit.pos - me.pos).magnitude / 96f:F0}t interaction={pulpit.obj_def?.interaction_type} has_craft={pulpit.obj_def?.has_craft} zone={pulpit.GetMyWorldZone()?.id} q={pulpit.GetMyWorldZone()?.GetTotalQuality()}")}");
+            var church = WorldMap.objs.Where(w => w != null && !w.is_removed && w.obj_id != null && (w.obj_id.Contains("pulpit") || w.obj_id.Contains("church") || w.obj_id.Contains("pray")))
+                                      .GroupBy(w => w.obj_id).Select(g => g.Key + "x" + g.Count());
+            Bot.Step("info church objects: " + string.Join(",", church));
+            var preach = GameBalance.me.items_data.Where(i => i.type == ItemDefinition.ItemType.Preach).Select(i => i.id);
+            Bot.Step("info sermon items: " + string.Join(",", preach));
+            var prays = GameBalance.me.craft_data.Where(c => c != null && c.id.StartsWith("pray:")).Take(10)
+                .Select(c => $"{c.id}[q={c.needs_quality} sub={c.linked_sub_id} needs={string.Join("+", c.needs.Select(n => n.id + "x" + n.value))} out={string.Join("+", c.output.Select(o => o.id + "x" + o.value))} vis={MainGame.me.save.IsCraftVisible(c)}]");
+            Bot.Step("info pray crafts: " + string.Join(" ", prays));
+            Bot.Step("info sermons in bag: " + string.Join(",", me.data.inventory.Where(i => i?.definition?.type == ItemDefinition.ItemType.Preach).Select(i => i.id)));
+        }
+
+        private static string SermonState()
+        {
+            var me = MainGame.me.player;
+            var r = PrayLogics.last_pray_result;
+            return $"faith={me.data.GetTotalCount("faith")} money={F(me.data.money)} sermons={me.data.GetTotalCount("b_empty")} prayed={me.GetParam("prayed_this_week")} " +
+                   $"control={GS.IsPlayerEnable()} last=[{r.pray_craft_id} ok={r.success} ppl={r.people} f={r.faith}+{r.faith_bonus} m={F(r.money)}+{F(r.money_bonus)}]";
+        }
+
+        /// <summary>The church donation box(es): "obj#uid:money".</summary>
+        private static string ChurchIncome() =>
+            string.Join(" ", WorldMap.objs.Where(w => w != null && !w.is_removed && w.unique_id > 0 && w.obj_id != null && w.obj_id.StartsWith("donat_box"))
+                                          .OrderBy(w => w.unique_id).Select(w => $"{w.obj_id}#{w.unique_id}:{F(w.GetParam("_money"))}"));
+
+        private static string FaithDiag() =>
+            "drops=[" + string.Join(" ", UnityEngine.Object.FindObjectsOfType<DropResGameObject>().Where(d => d != null && d.res != null && d.res.id == "faith")
+                                          .Select(d => $"{V(d.transform.position)}x{d.res.value}{(d.is_collected ? "(collected)" : "")}{(d.gameObject.activeInHierarchy ? "" : "(inactive)")}")) +
+            "] visitors=[" + string.Join(" ", WorldMap.objs.Where(w => w != null && !w.is_removed && w.obj_id != null && w.obj_id.Contains("church_visitor"))
+                                          .Select(w => $"{w.unique_id}:{F(w.GetParam("_money"))}@{V(w.pos)}{(w.gameObject.activeInHierarchy ? "" : "(inactive)")}")) + "]";
+
+        /// <summary>Sermon visitors still in the world (they leave and are removed after donating).</summary>
+        private static int Visitors() =>
+            WorldMap.objs.Count(w => w != null && !w.is_removed && w.obj_id != null && w.obj_id.Contains("church_visitor"));
+
+        private static float BoxMoney() =>
+            WorldMap.objs.Where(w => w != null && !w.is_removed && w.obj_id != null && w.obj_id.StartsWith("donat_box")).Sum(w => w.GetParam("_money"));
+
+        /// <summary>A sermon in each direction: one player preaches at the pulpit (opens the pulpit
+        /// window, picks a sermon, presses Pray, like the mouse does) while the other sits in the
+        /// church. Only the preacher spends the sermon and gets the result; the listener's bag and
+        /// purse stay as they were, both get control back, and both see the same donations.</summary>
+        private static IEnumerator Sermon()
+        {
+            var pulpit = WorldMap.GetWorldGameObjectByCustomTag("church_pulpit");
+            Bot.Require("church pulpit present", pulpit != null);
+            var inter = pulpit.obj_def.GetValidInteraction(pulpit);
+            Bot.Step($"info pulpit interaction script={inter?.script} dow={MainGame.me.save.day_of_week} income=[{ChurchIncome()}]");
+            yield return SermonRound(preacher: 1);
+            yield return SermonRound(preacher: 2);
+        }
+
+        private static IEnumerator SermonRound(int preacher)
+        {
+            var me = MainGame.me.player;
+            var pulpit = WorldMap.GetWorldGameObjectByCustomTag("church_pulpit");
+            const string sermon = "b_empty";
+            string k = "r" + preacher + "_";
+            Func<int> myFaith = () => me.data.GetTotalCount("faith");
+            if (Plugin.Player == preacher)
+            {
+                yield return Bot.WaitRemote(Other, k + "seated", "1", 60f);
+                yield return Bot.Wait(2f);   // the listener may pick up an earlier drop on the way in
+                int faithBase = myFaith() + int.Parse(Bot.Remote(Other, k + "faith")) + Drops("faith").Sum(d => d.res.value);
+                Bot.Step("info preacher start: " + FaithDiag());
+                yield return WalkUpTo(pulpit);
+                me.SetParam("prayed_this_week", 0f);     // this week's sermon may be spent already
+                if (me.data.GetTotalCount(sermon) == 0) me.data.AddItem(sermon, 1);
+                int have = me.data.GetTotalCount(sermon);
+                Bot.Step("info preacher before: " + SermonState());
+                float box0 = BoxMoney();
+                GUIElements.me.OpenCraftGUI(pulpit);
+                yield return Bot.Wait(1f);
+                var picker = GUIElements.me.pray_craft.GetComponent<ResourceBasedCraftGUI>();
+                Bot.Call(picker, "OnResourcePickerClosed", me.data.inventory.First(i => i?.id == sermon));
+                Bot.Step($"info picked: craft={GUIElements.me.pray_craft.pray_craft?.id}");
+                picker.OnCraftButtonPressed();
+                Bot.Publish(k + "preaching", "1");
+                float t0 = UnityEngine.Time.realtimeSinceStartup;
+                yield return Bot.WaitUntil("sermon started", () => !GS.IsPlayerEnable(), 20f);
+                // Track every visitor's purse and the box until the visitors are gone (diagnostic).
+                var lastMoney = new Dictionary<long, string>();
+                string boxTrail = ChurchIncome();
+                bool overSeen = false;
+                while (UnityEngine.Time.realtimeSinceStartup - t0 < 300f)
+                {
+                    bool over = GS.IsPlayerEnable() && PrayLogics.last_pray_result.pray_craft_id == "pray:" + sermon;
+                    if (over && !overSeen) { overSeen = true; Bot.Step("ok   sermon over"); }
+                    foreach (var v in WorldMap.objs.Where(w => w != null && !w.is_removed && w.obj_id != null && w.obj_id.Contains("church_visitor")))
+                        lastMoney[v.unique_id] = F(v.GetParam("_money")) + "@" + V(v.pos);
+                    string box = ChurchIncome();
+                    if (!boxTrail.EndsWith(box)) boxTrail += " > " + box;
+                    if (over && Visitors() == 0) break;
+                    yield return null;
+                }
+                Bot.Step($"info visitors' last purse: {string.Join(" ", lastMoney.Select(kv => kv.Key + ":" + kv.Value))} box: {boxTrail}");
+                var r = PrayLogics.last_pray_result;
+                Bot.Step($"info sermon took {UnityEngine.Time.realtimeSinceStartup - t0:F0}s; after: {SermonState()} windows={string.Join(",", BaseGUI.opened_windows.Select(w => w.GetType().Name))}");
+                Bot.Check("the sermon was preached", r.people > 0, SermonState());
+                Bot.Check("the sermon is kept for next week", me.data.GetTotalCount(sermon) == have, $"{have} -> {me.data.GetTotalCount(sermon)}");
+                Bot.Publish(k + "preached", "1");
+                // Visitors walk to the donation box, faith drops at the altar; let both settle.
+                Bot.Check("the visitors left", Visitors() == 0, FaithDiag());
+                float donated = BoxMoney() - box0, promised = r.money + r.money_bonus;
+                Bot.Check("the box got the visitors' donations", donated >= promised - 0.005f && donated <= promised + 0.1f, $"{F(donated)} for {F(promised)}");
+                int expect = r.success ? r.faith + r.faith_bonus : r.faith;
+                Func<int> faithNow = () => { var o = Bot.Remote(Other, k + "faith"); return myFaith() + (o == null ? 0 : int.Parse(o)) + Drops("faith").Sum(d => d.res.value); };
+                float s0 = UnityEngine.Time.realtimeSinceStartup;
+                while (faithNow() != faithBase + expect && UnityEngine.Time.realtimeSinceStartup - s0 < 30f) yield return Bot.Wait(0.5f);
+                yield return Bot.Wait(3f);   // a late duplicate would show up now
+                Bot.Step("info preacher end: " + FaithDiag());
+                Bot.Check("the sermon's faith arrived once (both bags + ground)", faithNow() == faithBase + expect,
+                          $"base {faithBase} + {expect} expected, have mine={myFaith()} partner={Bot.Remote(Other, k + "faith")} ground={Drops("faith").Sum(d => d.res.value)}");
+                Bot.Publish(k + "income", ChurchIncome());
+                yield return Bot.WaitRemote(Other, k + "done", "1", 60f);
+            }
+            else
+            {
+                me.PlaceAtPos(pulpit.pos + new Vector2(60f, -250f));   // in the pews
+                yield return Bot.Wait(1f);
+                float money0 = me.data.money;
+                string last0 = PrayLogics.last_pray_result.pray_craft_id + "/" + PrayLogics.last_pray_result.people;
+                Bot.Step("info listener start: " + FaithDiag());
+                Bot.Publish(k + "faith", myFaith().ToString());
+                Bot.Publish(k + "seated", "1");
+                float t0 = UnityEngine.Time.realtimeSinceStartup, pub = 0f;
+                bool sawCinematic = false;
+                while (Bot.Remote(preacher, k + "preached") == null && UnityEngine.Time.realtimeSinceStartup - t0 < 360f)
+                {
+                    sawCinematic |= !GS.IsPlayerEnable();
+                    if (UnityEngine.Time.realtimeSinceStartup - pub > 0.5f) { Bot.Publish(k + "faith", myFaith().ToString()); pub = UnityEngine.Time.realtimeSinceStartup; }
+                    yield return null;
+                }
+                Bot.Step($"info listener: sawCinematic={sawCinematic} pos={V(me.pos)} after: {SermonState()}");
+                yield return Bot.WaitUntil("listener has control", GS.IsPlayerEnable, 60f);
+                Bot.Check("listener's money unchanged", Mathf.Abs(me.data.money - money0) < 0.001f, $"{money0} -> {me.data.money}");
+                Bot.Check("the sermon ran only for the preacher", PrayLogics.last_pray_result.pray_craft_id + "/" + PrayLogics.last_pray_result.people == last0);
+                while (Bot.Remote(preacher, k + "income") == null)
+                {
+                    Bot.Publish(k + "faith", myFaith().ToString());
+                    yield return Bot.Wait(0.5f);
+                }
+                yield return Bot.WaitUntil("same donation box here", () => ChurchIncome() == Bot.Remote(preacher, k + "income"), 30f);
+                Bot.Step($"info donations: {ChurchIncome()} faith in my bag {myFaith()} " + FaithDiag());
+                Bot.Publish(k + "done", "1");
+            }
         }
 
         private static string GardenInfo(WorldGameObject w) => w == null ? "none" :

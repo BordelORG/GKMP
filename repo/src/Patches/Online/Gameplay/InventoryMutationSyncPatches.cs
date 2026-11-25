@@ -36,6 +36,30 @@ namespace GraveyardKeeperCoop.Patches
             }
         }
 
+        /// <summary>A client-side script adding to an object's own params (a sermon
+        /// visitor dropping money in the donation box) is a local change like an item
+        /// moving: mark it so a host snapshot that predates it cannot overwrite it before
+        /// it is sent. Players and NPCs are skipped (their params churn constantly and
+        /// are synced by their own systems).</summary>
+        [HarmonyPatch(typeof(WorldGameObject), nameof(WorldGameObject.AddToParams), new Type[] { typeof(string), typeof(float) })]
+        [HarmonyPostfix]
+        private static void WorldGameObject_AddToParams_Postfix(
+            WorldGameObject __instance,
+            float value)
+        {
+            if (value == 0f || __instance == null || __instance.is_player ||
+                InventorySync.IsSuppressingMutationCapture)
+            {
+                return;
+            }
+            var onlineCoop = GraveyardKeeperCoop.Network.OnlineCoopManager.Instance;
+            if (onlineCoop == null || !onlineCoop.IsOnlineCoopEnabled || onlineCoop.IsHost)
+                return;
+            if (__instance.obj_def == null || __instance.obj_def.IsNPC())
+                return;
+            InventorySync.Instance?.NotifyInventoryMutated(__instance);
+        }
+
         [HarmonyPatch(typeof(Item), "AddItem", new Type[]
         {
             typeof(Item),
