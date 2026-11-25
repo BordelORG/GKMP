@@ -970,6 +970,13 @@ namespace CoopQA
                 yield return Bot.WaitUntil("joiner profile committed with the host save", () => NewestWrite(profileDir, "gkcoop_joiner_inventory_*") > profileBefore, 30f);
 
             var state = PersonalState();
+            state["workers"] = WorkersDigest();
+            if (Bot.IsHost)
+            {
+                var l1 = MainGame.me.save.dungeons.GetSavedDungeon(1);
+                state["dungeon1_alive"] = l1 == null || l1.objects == null || l1.objects.Count == 0 ? "fresh"
+                    : l1.objects.Count(o => o.type == DungeonGenerator.SavedDungeonObject.SavedDungeonObjectType.Mob && o.mob_is_alive).ToString();
+            }
             if (Bot.IsHost)
                 foreach (var uid in Diag.Destroyed)
                     state["obj" + uid] = WorldMap.GetWorldGameObjectByUniqueId(uid, false)?.obj_id ?? "none";
@@ -1115,12 +1122,74 @@ namespace CoopQA
                     string here = WorldMap.GetWorldGameObjectByUniqueId(uid, false)?.obj_id ?? "none";
                     Bot.Check($"world object #{uid} as saved", here == kv.Value, $"{here} vs {kv.Value}");
                 }
+            // Zombie workers: where they are and whether they work, the same as saved and on both sides.
+            string workers = WorkersDigest();
+            Bot.Step("info workers now: " + workers);
+            if (was.ContainsKey("workers"))
+                Bot.Check("zombie workers as saved", workers == was["workers"], $"now [{workers}] saved [{was["workers"]}]");
+            Bot.Publish("resume_workers", workers);
+            yield return Bot.WaitUntil("other side's workers", () => Bot.Remote(Other, "resume_workers") != null, 30f);
+            Bot.Check("zombie workers the same on both sides", Bot.Remote(Other, "resume_workers") == workers,
+                      $"here [{workers}] there [{Bot.Remote(Other, "resume_workers")}]");
+
+            // The dungeon: the monsters killed last evening stay dead, both see the same ones.
+            Bot.KeepAlive = true;
+            if (Bot.IsHost)
+            {
+                MainGame.me.TeleportToDungeonLevel(1);
+                yield return Bot.WaitUntil("in the dungeon", () => DungeonLevel() == 1, 20f);
+                yield return Bot.WaitUntil("can move", CanMove, 15f);
+                yield return Bot.Wait(4f);
+                Bot.Publish("resume_dungeon", "1");
+            }
+            else
+            {
+                yield return Bot.WaitUntil("host in the dungeon", () => Bot.Remote(1, "resume_dungeon") != null, 60f);
+                yield return Bot.WaitUntil("taken along into the dungeon", () => DungeonLevel() == 1, 30f);
+                yield return Bot.WaitUntil("can move", CanMove, 15f);
+                yield return Bot.Wait(4f);
+            }
+            if (Bot.IsHost && was.TryGetValue("dungeon1_alive", out var alive) && alive != "fresh")
+                Bot.Check("dungeon level 1: only the monsters alive last evening", DungeonMobs().Count.ToString() == alive,
+                          $"{DungeonMobs().Count} monsters, {alive} were alive");
+            yield return SameMobs("resume_mobs", "dungeon level 1: the same monsters on both sides");
+            if (Bot.IsHost)
+            {
+                yield return Bot.WaitRemote(2, "resume_ready_out", "1", 30f);
+                var exit = WorldMap.objs.Where(w => w != null && !w.is_removed && w.obj_id == "dungeon_exit")
+                                        .OrderBy(w => (w.pos - MainGame.me.player.pos).sqrMagnitude).FirstOrDefault();
+                if (exit != null)
+                {
+                    yield return WalkUpTo(exit, 120f);
+                    yield return FakeInput.Press(GameKey.Interaction);
+                }
+                yield return Bot.WaitUntil("left the dungeon", () => !InDungeon(), 20f);
+                Bot.Publish("resume_out", "1");
+            }
+            else
+            {
+                Bot.Publish("resume_ready_out", "1");
+                yield return Bot.WaitUntil("host walked out", () => Bot.Remote(1, "resume_out") != null, 90f);
+                yield return Bot.WaitUntil("taken out of the dungeon too", () => !InDungeon(), 20f);
+            }
+
             string mine = MyWorld();
             Bot.Publish("resume_world", mine);
             yield return Bot.WaitUntil("other side reported its world", () => Bot.Remote(Other, "resume_world") != null, 30f);
             Bot.Check("both sides load the same stumps", Bot.Remote(Other, "resume_world") == mine,
                       $"here [{mine}] there [{Bot.Remote(Other, "resume_world")}]");
         }
+
+        /// <summary>Zombie workers: kind, place (tiles), working or in stock, and the bench they serve.</summary>
+        private static string WorkersDigest() =>
+            string.Join(";", WorldMap.objs.Where(w => w != null && !w.is_removed && w.worker != null)
+                .Select(w =>
+                {
+                    var bench = WorldMap.objs.FirstOrDefault(b => b != null && !b.is_removed && b.linked_worker == w);
+                    return $"{w.unique_id}:{w.obj_id}@{Mathf.RoundToInt(w.pos.x / 96f)},{Mathf.RoundToInt(w.pos.y / 96f)}" +
+                           $" disabled={w.GetParamInt("is_disabled")} bench={(bench == null ? "-" : bench.unique_id.ToString())}";
+                })
+                .OrderBy(x => x));
 
         private static string MyWorld() =>
             string.Join(";", WorldMap.objs.Where(w => w != null && w.unique_id > 0 && w.obj_id != null && w.obj_id.Contains("stump"))
