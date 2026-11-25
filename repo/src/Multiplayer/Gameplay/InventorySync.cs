@@ -829,6 +829,23 @@ namespace GraveyardKeeperCoop.Multiplayer
 
             try
             {
+                if (!onlineCoop.IsHost && HasPendingExplicitLocalChanges() && !hasHostBaseline)
+                {
+                    // The client changed something (e.g. bought from a vendor) before the
+                    // host's first snapshot arrived. It cannot send without a baseline, and
+                    // refusing the snapshot meant it never got one: the change was stuck
+                    // forever. Take the host's state for everything else, keep the local
+                    // changes, then send them.
+                    ApplyFirstHostSnapshotKeepingLocalChanges(snapshot);
+                    if (!hasAnnouncedPersonalInventory)
+                    {
+                        hasAnnouncedPersonalInventory = true;
+                        locallyMutatedWgoKeys.Add("player:local");
+                    }
+                    SendLocalSnapshot(force: true);
+                    return;
+                }
+
                 if (!onlineCoop.IsHost && HasPendingExplicitLocalChanges())
                 {
                     RxDebug($"client has pending local changes ({locallyMutatedWgoKeys.Count} keys, immediate={hasPendingImmediateSend}); resending instead of applying");
@@ -1485,6 +1502,36 @@ namespace GraveyardKeeperCoop.Multiplayer
             {
                 isApplyingRemote = false;
             }
+        }
+
+        private void ApplyFirstHostSnapshotKeepingLocalChanges(InventorySnapshot snapshot)
+        {
+            List<InventoryWgoEntry> all = snapshot.WgoEntries;
+            bool hadDrops = snapshot.HasDrops;
+            var kept = new List<InventoryWgoEntry>(all.Count);
+            int preserved = 0;
+            for (int i = 0; i < all.Count; i++)
+            {
+                if (locallyMutatedWgoKeys.Contains(all[i].Key)) { preserved++; continue; }
+                kept.Add(all[i]);
+            }
+            try
+            {
+                snapshot.WgoEntries = kept;
+                // A pending immediate send is a local drop pick-up/throw: do not undo it.
+                if (hasPendingImmediateSend) snapshot.HasDrops = false;
+                ApplySnapshot(snapshot);
+            }
+            finally
+            {
+                snapshot.WgoEntries = all;
+                snapshot.HasDrops = hadDrops;
+            }
+            // The baseline is the host's state, so the preserved local entries differ from it
+            // and go out with the next send.
+            ApplySnapshotToBaseline(snapshot);
+            CoopMod.Logger.LogInfo(
+                $"[InventorySync] First host snapshot applied; kept {preserved} local change(s) made before it arrived");
         }
 
         private void ApplySnapshotToBaseline(InventorySnapshot snapshot)

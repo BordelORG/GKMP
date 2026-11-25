@@ -116,7 +116,9 @@ namespace CoopQA
             yield return Join(holdSeconds: 5f);
             Bot.HardWaits = false;
             var known = SyncTests.All.Concat(SyncTests.Extra).ToList();
-            // A filter runs the named tests in the order given; no filter runs All in order.
+            // A filter runs the named tests in the order given ("all" stands for the whole
+            // default list, e.g. "net_hiccups,all"); no filter runs All in order.
+            if (only != null) only = only.SelectMany(n => n == "all" ? SyncTests.All.Select(k => k.Key) : new[] { n }).ToList();
             var run = only == null ? SyncTests.All
                                    : only.Select(n => known.FirstOrDefault(k => k.Key == n)).Where(k => k.Key != null).ToList();
             foreach (var n in only ?? new List<string>())

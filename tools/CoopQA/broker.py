@@ -97,16 +97,21 @@ async def leave(sid, lid):
     await push_state(lid, {"op": "chat_update", "lobby": lid, "user": sid, "by": sid, "change": 2})
 
 
-async def deliver_p2p(target, msg):
-    if args.lag:
-        await asyncio.sleep(args.lag / 1000.0)
+blackout_until = 0.0   # loop time: until then the link is down (see op "blackout")
+last_deadline = {}     # target -> last scheduled delivery, keeps each stream in order
+
+
+async def deliver_p2p(target, msg, deadline):
+    delay = deadline - asyncio.get_event_loop().time()
+    if delay > 0:
+        await asyncio.sleep(delay)
     c = clients.get(target)
     if c:
         await c.send(msg)
 
 
 async def handle(msg, c):
-    global next_lobby
+    global next_lobby, blackout_until
     op = msg.get("op")
     if op == "hello":
         c.player = int(msg["player"])
@@ -188,14 +193,24 @@ async def handle(msg, c):
     elif op == "p2p":
         target = int(msg["to"])
         out = {"op": "p2p", "from": c.steam_id, "ch": msg["ch"], "data": msg["data"], "rel": msg["rel"]}
-        if not msg["rel"] and args.drop and random.random() < args.drop:
+        now = asyncio.get_event_loop().time()
+        down = now < blackout_until
+        if not msg["rel"] and (down or (args.drop and random.random() < args.drop)):
             return
-        if args.lag:
-            asyncio.ensure_future(deliver_p2p(target, out))
+        if args.lag or down or last_deadline.get(target, 0.0) > now:
+            # Reliable traffic sent while the link is down arrives once it is back (Steam resends it).
+            deadline = max(now, blackout_until if down else now) + args.lag / 1000.0
+            deadline = max(deadline, last_deadline.get(target, 0.0))
+            last_deadline[target] = deadline
+            asyncio.ensure_future(deliver_p2p(target, out, deadline))
         else:
             t = clients.get(target)
             if t:
                 await t.send(out)
+    elif op == "blackout":
+        # A test cuts the P2P link for a while (both directions): an internet hiccup.
+        blackout_until = asyncio.get_event_loop().time() + float(msg.get("ms", 3000)) / 1000.0
+        log("blackout", msg.get("ms"), "ms by", c.name)
     elif op == "qa":
         log("qa", c.name, msg.get("k"), "=", msg.get("v"))
         for o in clients.values():

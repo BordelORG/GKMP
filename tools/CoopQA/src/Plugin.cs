@@ -69,6 +69,7 @@ namespace CoopQA
             // Tests among monsters: the bot does not dodge, so keep its player alive.
             if (Bot.KeepAlive && MainGame.me?.player != null && !MainGame.me.player.is_dead && MainGame.me.player.hp < 60f)
                 MainGame.me.player.hp = 100f;
+            Bot.TickHiccups();
             Bot.Tick();
         }
     }

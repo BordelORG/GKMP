@@ -70,9 +70,19 @@ namespace CoopQA
             new KeyValuePair<string, Func<IEnumerator>>("morgue_probe", MorgueProbe),
             new KeyValuePair<string, Func<IEnumerator>>("dungeon_probe", DungeonProbe),
             new KeyValuePair<string, Func<IEnumerator>>("days", Days),
+            // Put first in a suite filter: the tests after it run through repeated 4 s link outages.
+            new KeyValuePair<string, Func<IEnumerator>>("net_hiccups", NetHiccups),
         };
 
         private static int Other => Bot.IsHost ? 2 : 1;
+
+        private static IEnumerator NetHiccups()
+        {
+            Bot.HiccupPeriod = 45f;
+            Bot.HiccupMs = 4000;
+            Bot.Step("info the link goes down for 4 s every 45 s from now on");
+            yield break;
+        }
         private static string F(float v) => v.ToString("0.#####", CultureInfo.InvariantCulture);
         private static float PF(string s) => float.Parse(s, CultureInfo.InvariantCulture);
 

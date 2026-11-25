@@ -83,6 +83,25 @@ namespace CoopQA
         /// <summary>While set, the local player is healed whenever its health drops low.</summary>
         public static bool KeepAlive;
 
+        /// <summary>Net hiccups for the rest of the run (host only): every <see cref="HiccupPeriod"/>
+        /// seconds the P2P link goes down for <see cref="HiccupMs"/> ms.</summary>
+        public static float HiccupPeriod;
+        public static int HiccupMs;
+        public static int Hiccups;
+        private static float nextHiccup;
+
+        public static void TickHiccups()
+        {
+            if (HiccupPeriod <= 0f || !IsHost || Plugin.Broker == null) return;
+            float now = UnityEngine.Time.realtimeSinceStartup;
+            if (nextHiccup <= 0f) nextHiccup = now + HiccupPeriod;
+            if (now < nextHiccup) return;
+            nextHiccup = now + HiccupPeriod;
+            Hiccups++;
+            Plugin.Broker.Send(new { op = "blackout", ms = HiccupMs });
+            Step($"info net hiccup #{Hiccups}: link down {HiccupMs} ms");
+        }
+
         public static IEnumerator WaitUntil(string what, Func<bool> cond, float timeout)
         {
             float t0 = Time.realtimeSinceStartup;
