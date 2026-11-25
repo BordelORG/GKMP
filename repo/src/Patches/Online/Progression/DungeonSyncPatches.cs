@@ -96,20 +96,30 @@ namespace GraveyardKeeperCoop.Patches
             UniqueIdCounter.SetValue(null, DungeonUidBase + Math.Max(0, level) * DungeonUidPerLevel);
             __state.Level = level;
             // A fresh level (the host enters it, so both build it from the host's saved state):
-            // forget the kills of the last copy. A partner rebuilding it alone (e.g. after dying)
-            // keeps them and removes those monsters again below.
+            // forget the kills of the last copy. A partner rebuilding it alone (after dying, or
+            // after wandering to another level and being brought back) keeps them and removes
+            // those monsters again below. Kills are kept per level, so a trip to another level
+            // does not lose them.
             bool isHost = GraveyardKeeperCoop.Network.OnlineCoopManager.Instance?.IsHost ?? true;
-            if (isHost || hostGeneratedLevel == level || killedLevel != level)
+            if (killedSeed != seed)
             {
-                killed.Clear();
-                killedLevel = level;
+                killedByLevel.Clear();
+                killedSeed = seed;
+            }
+            if (isHost || hostGeneratedLevel == level)
+            {
+                killedByLevel.Remove(level);
                 hostGeneratedLevel = -1;
             }
             CoopMod.Logger.LogInfo($"[DungeonSync] Generating level {level} (seed {seed}) with shared random state and ids");
         }
 
-        private static readonly System.Collections.Generic.HashSet<long> killed = new System.Collections.Generic.HashSet<long>();
-        private static int killedLevel = -1;
+        private static readonly System.Collections.Generic.Dictionary<int, System.Collections.Generic.HashSet<long>> killedByLevel =
+            new System.Collections.Generic.Dictionary<int, System.Collections.Generic.HashSet<long>>();
+        private static int killedSeed = int.MinValue;
+
+        // Dungeon ids carry their level: base + level * per-level + n.
+        private static int LevelOfUid(long uid) => (int)((uid - DungeonUidBase) / DungeonUidPerLevel);
         private static int hostGeneratedLevel = -1;
 
         internal static void OnHostGeneratesLevel(int level) => hostGeneratedLevel = level;
@@ -119,8 +129,11 @@ namespace GraveyardKeeperCoop.Patches
         [HarmonyPrefix]
         internal static void DestroyMe_Prefix(WorldGameObject __instance)
         {
-            if (__instance != null && !generating && IsDungeonUid(__instance.unique_id))
-                killed.Add(__instance.unique_id);
+            if (__instance == null || generating || !IsDungeonUid(__instance.unique_id)) return;
+            int level = LevelOfUid(__instance.unique_id);
+            if (!killedByLevel.TryGetValue(level, out var set))
+                killedByLevel[level] = set = new System.Collections.Generic.HashSet<long>();
+            set.Add(__instance.unique_id);
         }
 
         // The partner keeps the host's saved state of the level: its own save (on death or when
@@ -144,7 +157,7 @@ namespace GraveyardKeeperCoop.Patches
                 generating = false;
                 UnityEngine.Random.state = __state.Random;
                 UniqueIdCounter.SetValue(null, __state.UniqueId);
-                if (killed.Count > 0 && killedLevel == __state.Level && MainGame.me?.dungeon_root != null)
+                if (killedByLevel.TryGetValue(__state.Level, out var killed) && killed.Count > 0 && MainGame.me?.dungeon_root != null)
                 {
                     int removed = 0;
                     foreach (var wgo in MainGame.me.dungeon_root.GetComponentsInChildren<WorldGameObject>(true))

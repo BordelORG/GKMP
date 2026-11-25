@@ -52,6 +52,8 @@ namespace GraveyardKeeperCoop.Patches
         [HarmonyPrefix]
         public static void Update_Prefix(ChunkManager __instance)
         {
+            DropDestroyedPendingAdds();
+
             var manager = LocalCoop.LocalCoopManager.Instance;
             if (manager == null || !manager.IsLocalCoopEnabled)
             {
@@ -125,6 +127,24 @@ namespace GraveyardKeeperCoop.Patches
             Vector3 midpoint = (player1Pos + player2Pos) / 2f;
             
             _cameraPosField.SetValue(null, midpoint);
+        }
+
+        private static readonly System.Collections.Generic.List<ChunkedGameObject> PendingAdds =
+            AccessTools.Field(typeof(ChunkManager), "_objs_to_add")?.GetValue(null) as System.Collections.Generic.List<ChunkedGameObject>;
+
+        /// <summary>
+        /// Vanilla Update reads item.gameObject for every object queued since the last frame and
+        /// clears the queue only afterwards. An object destroyed while still queued (e.g. a dungeon
+        /// level built and torn down again within a frame or two, as when the coop host pulls a
+        /// partner back to its own level) throws there, the queue is never cleared, and the
+        /// exception repeats every frame: no chunk visibility updates any more. Drop dead entries.
+        /// </summary>
+        private static void DropDestroyedPendingAdds()
+        {
+            if (PendingAdds == null || PendingAdds.Count == 0) return;
+            int removed = PendingAdds.RemoveAll(c => c == null);
+            if (removed > 0)
+                CoopMod.Logger.LogInfo($"[ChunkManager] Dropped {removed} destroyed object(s) queued for chunk registration");
         }
 
         /// <summary>

@@ -51,6 +51,7 @@ namespace CoopQA
             new KeyValuePair<string, Func<IEnumerator>>("workers", Workers),
             new KeyValuePair<string, Func<IEnumerator>>("dungeon", Dungeon),
             new KeyValuePair<string, Func<IEnumerator>>("dungeon_combat", DungeonCombat),
+            new KeyValuePair<string, Func<IEnumerator>>("dungeon_levels", DungeonLevels),
             new KeyValuePair<string, Func<IEnumerator>>("sleep_rested_client", () => Sleep(clientTired: false, wakeWithKey: false)),
             new KeyValuePair<string, Func<IEnumerator>>("sleep_wake_with_key", () => Sleep(clientTired: true, wakeWithKey: true)),
             new KeyValuePair<string, Func<IEnumerator>>("time_after_sleep", Time),
@@ -1665,6 +1666,156 @@ namespace CoopQA
                 yield return Bot.WaitUntil("taken out of the dungeon too", () => !InDungeon(), 20f);
                 yield return Bot.WaitUntil("can move again", CanMove, 10f);
                 Bot.Publish("dmobs_done", "1");
+            }
+        }
+
+        private static int DungeonLevel() =>
+            InDungeon() ? (MainGame.me.dungeon_root.cur_dungeon_preset?.dungeon_level ?? -1) : 0;
+
+        /// <summary>Both sides list their monsters under <paramref name="key"/>; they must match.</summary>
+        private static IEnumerator SameMobs(string key, string what)
+        {
+            Bot.Publish(key, MobKinds(DungeonMobs()));
+            yield return Bot.WaitUntil("partner's monsters " + key, () => Bot.Remote(Other, key) != null, 40f);
+            yield return Bot.Wait(1f);
+            string mine = MobKinds(DungeonMobs()), there = Bot.Remote(Other, key);
+            Bot.Check(what, mine == there, $"here [{mine}] there [{there}]");
+            if (mine != there) Bot.Step("info here: " + MobList(DungeonMobs()));
+        }
+
+        /// <summary>One player kills the nearest monster, the other sees it die. Returns "uid|kind" in <paramref name="killed"/>.</summary>
+        private static IEnumerator KillOne(int fighter, string key, string[] killed)
+        {
+            var me = MainGame.me.player;
+            if (Plugin.Player == fighter)
+            {
+                var target = DungeonMobs().OrderBy(w => (w.pos - me.pos).sqrMagnitude).FirstOrDefault();
+                Bot.Check("a monster to fight", target != null);
+                string ann = target == null ? "none" : $"{target.unique_id}|{target.obj_id}|{V(target.pos)}";
+                Bot.Publish(key, ann);
+                if (target == null) yield break;
+                killed[0] = ann;
+                yield return Fight(target.unique_id, target.obj_id, 60f);
+                Bot.Publish(key + "_done", "1");
+                yield return Bot.WaitUntil("partner saw it die", () => Bot.Remote(Other, key + "_seen") != null, 40f);
+            }
+            else
+            {
+                yield return Bot.WaitUntil("partner picked a monster", () => Bot.Remote(fighter, key) != null, 30f);
+                string ann = Bot.Remote(fighter, key);
+                if (ann == "none") yield break;
+                killed[0] = ann;
+                var p = ann.Split('|');
+                long uid = long.Parse(p[0]);
+                Bot.Check("the partner's monster exists here", !Gone(uid, p[1]), ann + " | here: " + MobList(DungeonMobs()));
+                yield return Bot.WaitUntil("partner finished the fight", () => Bot.Remote(fighter, key + "_done") != null, 75f);
+                yield return Bot.WaitUntil("the monster died here too", () => Gone(uid, p[1]), 10f);
+                Bot.Publish(key + "_seen", "1");
+            }
+        }
+
+        private static void StillDead(string ann, string where)
+        {
+            if (string.IsNullOrEmpty(ann)) return;
+            var p = ann.Split('|');
+            Bot.Check($"the {p[1]} killed on {where} is still dead", Gone(long.Parse(p[0]), p[1]), Describe(long.Parse(p[0])));
+        }
+
+        /// <summary>The host leads both between dungeon levels 1 and 2: each level looks the same on
+        /// both sides, kills stay on the level they were made on, and the client cannot wander off to
+        /// another level alone (it follows the host).</summary>
+        private static IEnumerator DungeonLevels()
+        {
+            Bot.KeepAlive = true;
+            string[] kill1 = new string[1], kill2 = new string[1];
+
+            yield return GoToLevel(1, "dl_in1");
+            yield return SameMobs("dl_m1", "level 1: the same monsters on both sides");
+            yield return KillOne(1, "dl_k1", kill1);
+            yield return Bot.Wait(1f);
+            int left1 = DungeonMobs().Count;
+
+            // The client tries another level on its own and is brought back to the host's.
+            if (Bot.IsHost)
+            {
+                yield return Bot.WaitUntil("partner tried a level alone", () => Bot.Remote(2, "dl_solo") != null, 90f);
+                Bot.Check("the host stayed on level 1", DungeonLevel() == 1, "level " + DungeonLevel());
+            }
+            else
+            {
+                MainGame.me.TeleportToDungeonLevel(2);
+                yield return Bot.Wait(1f);
+                Bot.Step("info alone on level " + DungeonLevel());
+                yield return Bot.WaitUntil("brought back to the host's level 1", () => DungeonLevel() == 1, 40f);
+                yield return Bot.WaitUntil("can move", CanMove, 15f);
+                yield return Bot.Wait(2f);
+                StillDead(kill1[0], "level 1");
+                Bot.Publish("dl_solo", "1");
+            }
+            yield return SameMobs("dl_m1b", "level 1 after the solo trip: the same monsters");
+
+            yield return GoToLevel(2, "dl_in2");
+            yield return SameMobs("dl_m2", "level 2: the same monsters on both sides");
+            yield return KillOne(2, "dl_k2", kill2);
+            yield return Bot.Wait(1f);
+            int left2 = DungeonMobs().Count;
+
+            // A revisited level is rebuilt from the host's save, which gives the monsters left new
+            // ids (as in the single-player game); what must hold is that the dead stay dead.
+            yield return GoToLevel(1, "dl_in1c");
+            Bot.Check("back on level 1: the killed monster did not come back", DungeonMobs().Count == left1, $"{DungeonMobs().Count} monsters, {left1} were left");
+            yield return SameMobs("dl_m1c", "back on level 1: the same monsters");
+
+            yield return GoToLevel(2, "dl_in2c");
+            Bot.Check("back on level 2: the killed monster did not come back", DungeonMobs().Count == left2, $"{DungeonMobs().Count} monsters, {left2} were left");
+            yield return SameMobs("dl_m2c", "back on level 2: the same monsters");
+
+            // Out of the dungeon.
+            var me = MainGame.me.player;
+            if (Bot.IsHost)
+            {
+                yield return Bot.WaitRemote(2, "dl_ready_out", "1", 30f);
+                var exit = WorldMap.objs.Where(w => w != null && !w.is_removed && w.obj_id == "dungeon_exit")
+                                        .OrderBy(w => (w.pos - me.pos).sqrMagnitude).FirstOrDefault();
+                Bot.Check("found the dungeon exit", exit != null);
+                if (exit != null)
+                {
+                    yield return WalkUpTo(exit, 120f);
+                    yield return FakeInput.Press(GameKey.Interaction);
+                    yield return Bot.WaitUntil("left the dungeon", () => !InDungeon(), 20f);
+                }
+                yield return Bot.WaitUntil("can move again", CanMove, 10f);
+                Bot.Publish("dl_out", "1");
+                yield return Bot.WaitRemote(2, "dl_done", "1", 60f);
+            }
+            else
+            {
+                Bot.Publish("dl_ready_out", "1");
+                yield return Bot.WaitUntil("host walked out", () => Bot.Remote(1, "dl_out") != null, 90f);
+                yield return Bot.WaitUntil("taken out of the dungeon too", () => !InDungeon(), 20f);
+                yield return Bot.WaitUntil("can move again", CanMove, 10f);
+                Bot.Publish("dl_done", "1");
+            }
+        }
+
+        private static IEnumerator GoToLevel(int level, string key)
+        {
+            if (Bot.IsHost)
+            {
+                MainGame.me.TeleportToDungeonLevel(level);
+                yield return Bot.WaitUntil("on level " + level, () => DungeonLevel() == level, 15f);
+                yield return Bot.WaitUntil("can move", CanMove, 15f);
+                yield return Bot.Wait(4f);
+                Bot.Publish(key, "1");
+                yield return Bot.WaitRemote(2, key + "_ok", "1", 60f);
+            }
+            else
+            {
+                yield return Bot.WaitUntil("host on level " + level, () => Bot.Remote(1, key) != null, 60f);
+                yield return Bot.WaitUntil("taken along to level " + level, () => DungeonLevel() == level, 30f);
+                yield return Bot.WaitUntil("can move", CanMove, 15f);
+                yield return Bot.Wait(4f);
+                Bot.Publish(key + "_ok", "1");
             }
         }
 
