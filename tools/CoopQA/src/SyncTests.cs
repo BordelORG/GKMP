@@ -44,6 +44,7 @@ namespace CoopQA
             new KeyValuePair<string, Func<IEnumerator>>("grave_client", () => Craft(2, IsGrave, c => c.id == "set_grave_bot_stn_2", StartGravePart)),
             new KeyValuePair<string, Func<IEnumerator>>("trade_host", () => Trade(1)),
             new KeyValuePair<string, Func<IEnumerator>>("trade_client", () => Trade(2)),
+            new KeyValuePair<string, Func<IEnumerator>>("vendor_day_end", VendorDayEnd),
             new KeyValuePair<string, Func<IEnumerator>>("fishing_host", () => Fishing(1)),
             new KeyValuePair<string, Func<IEnumerator>>("fishing_client", () => Fishing(2)),
             new KeyValuePair<string, Func<IEnumerator>>("build_host", () => Build(1)),
@@ -51,6 +52,7 @@ namespace CoopQA
             new KeyValuePair<string, Func<IEnumerator>>("workers", Workers),
             new KeyValuePair<string, Func<IEnumerator>>("garden", Garden),
             new KeyValuePair<string, Func<IEnumerator>>("sermon", Sermon),
+            new KeyValuePair<string, Func<IEnumerator>>("porters", Porters),
             new KeyValuePair<string, Func<IEnumerator>>("dungeon", Dungeon),
             new KeyValuePair<string, Func<IEnumerator>>("dungeon_combat", DungeonCombat),
             new KeyValuePair<string, Func<IEnumerator>>("dungeon_levels", DungeonLevels),
@@ -74,6 +76,7 @@ namespace CoopQA
             new KeyValuePair<string, Func<IEnumerator>>("days", Days),
             new KeyValuePair<string, Func<IEnumerator>>("garden_probe", GardenProbe),
             new KeyValuePair<string, Func<IEnumerator>>("sermon_probe", SermonProbe),
+            new KeyValuePair<string, Func<IEnumerator>>("porter_probe", PorterProbe),
             // Put first in a suite filter: the tests after it run through repeated 4 s link outages.
             new KeyValuePair<string, Func<IEnumerator>>("net_hiccups", NetHiccups),
         };
@@ -117,6 +120,166 @@ namespace CoopQA
             Bot.Step("info pray crafts: " + string.Join(" ", prays));
             Bot.Step("info sermons in bag: " + string.Join(",", me.data.inventory.Where(i => i?.definition?.type == ItemDefinition.ItemType.Preach).Select(i => i.id)));
         }
+
+        private static IEnumerator PorterProbe()
+        {
+            if (!Bot.IsHost) yield break;
+            var stations = WorldMap.objs.Where(w => w != null && !w.is_removed && w.obj_def != null && w.obj_def.type == ObjectDefinition.ObjType.PorterStation).ToList();
+            Bot.Step($"info porter stations: {stations.Count}");
+            foreach (var st in stations)
+            {
+                var ps = st.porter_station;
+                Bot.Step($"info {st.obj_id}#{st.unique_id} @{V(st.pos)} zone={st.GetMyWorldZone()?.id} state={ps?.state} worker={(st.has_linked_worker ? st.linked_worker.obj_id + "#" + st.linked_worker.unique_id : "-")} src={ps?.source?.id} dst={ps?.destination?.id}");
+            }
+            foreach (var tp in GameBalance.me.transport_paths.Take(20))
+                Bot.Step($"info path {tp.station_wgo_id}: {tp.source_zone_id} -> {tp.destination_zone_id} items={string.Join(",", tp.transport_items.Take(8))}");
+            var crafts = GameBalance.me.craft_data.Where(c => c != null && c.id.Contains("porter")).Select(c => $"{c.id}[vis={MainGame.me.save.IsCraftVisible(c)} needs={string.Join("+", c.needs.Select(n => n.id + "x" + n.value))}]");
+            Bot.Step("info porter crafts: " + string.Join(" ", crafts));
+            Bot.Step("info objdefs: " + string.Join(",", GameBalance.me.objs_data.Where(o => o.type == ObjectDefinition.ObjType.PorterStation).Select(o => o.id)));
+            var workers = WorldMap.objs.Where(w => w != null && !w.is_removed && w.worker != null && w.IsWorker()).Select(w => $"{w.obj_id}#{w.unique_id}@{V(w.pos)}");
+            Bot.Step("info workers: " + string.Join(" ", workers));
+            foreach (var zid in new[] { "stone_workyard", "zombie_sawmill", "mf_wood", "vineyard", "cellar", "cellar_storage", "storage", "player_tavern_cellar" })
+            {
+                var zone = WorldZone.GetZoneByID(zid, false);
+                var gd = WorldMap.GetGDPointByGDTag(zid + "_d");
+                var inv = zone == null ? "" : string.Join(" ", WorldMap.objs.Where(w => w != null && !w.is_removed && w.GetMyWorldZone() == zone && w.obj_def != null && w.obj_def.inventory_size > 0)
+                                                               .Select(w => $"{w.obj_id}#{w.unique_id}[{w.data.inventory.Count}/{w.obj_def.inventory_size}]").Take(10));
+                Bot.Step($"info zone {zid}: {(zone == null ? "missing" : "ok")} gd={(gd == null ? "-" : V(gd.pos))} storages: {inv}");
+            }
+        }
+
+        /// <summary>Wood per place: "zone:count" for the sawmill, the wood storage and the
+        /// porter's backpack, as this side sees them.</summary>
+        private static string WoodDigest(long stationUid)
+        {
+            int Zone(string id)
+            {
+                var zone = WorldZone.GetZoneByID(id, false);
+                return zone == null ? -1 : WorldMap.objs.Where(w => w != null && !w.is_removed && w.GetMyWorldZone() == zone && w.data?.inventory != null && !w.is_player)
+                                                        .Sum(w => w.data.inventory.Where(i => i?.id == "wood").Sum(i => i.value));
+            }
+            var st = WorldMap.GetWorldGameObjectByUniqueId(stationUid, false);
+            var z = st?.linked_worker;
+            int carried = z?.worker?.GetBackpack()?.inventory?.Where(i => i?.id == "wood").Sum(i => i.value) ?? 0;
+            return $"sawmill={Zone("zombie_sawmill")} mf_wood={Zone("mf_wood")} carried={carried} ground={Drops("wood").Sum(d => d.res.value)}";
+        }
+
+        private static string PorterInfo(long stationUid)
+        {
+            var st = WorldMap.GetWorldGameObjectByUniqueId(stationUid, false);
+            var z = st?.linked_worker;
+            return st == null ? "no station" : $"state={st.porter_station?.state} worker={(z == null ? "-" : z.unique_id + "@" + V(z.pos) + " active=" + z.gameObject.activeInHierarchy)}";
+        }
+
+        /// <summary>Zombie logistics: the host builds a porter station at the sawmill with a
+        /// stack of wood and gives it a zombie. The wood must arrive at the wood storage once,
+        /// both sides must agree on where every log is, and the client must not run its own
+        /// copy of the porter (that moved the same wood twice).</summary>
+        private static IEnumerator Porters()
+        {
+            var me = MainGame.me.player;
+            const int wood = 4;   // two trips (logs are big: two per load); between them the station waits with its zombie
+            // The porter takes minutes; night bats find the idle players meanwhile (the
+            // host died here once, and its death scene then held it in the dungeon test).
+            Bot.KeepAlive = true;   // Suite resets it
+            if (Bot.IsHost)
+            {
+                var src = WorldMap.GetGDPointByGDTag("zombie_sawmill_d");
+                Bot.Require("sawmill point", src != null);
+                me.PlaceAtPos((Vector2)src.pos + new Vector2(0f, -200f));
+                yield return Bot.Wait(2f);
+                // Two free spots inside the sawmill zone, near its porter point.
+                var spots = new List<Vector2>();
+                for (int r = 1; r <= 8 && spots.Count < 2; r++)
+                    foreach (var dir in new[] { Vector2.left, Vector2.up, Vector2.right, Vector2.down })
+                    {
+                        var at = (Vector2)src.pos + dir * (96f * r);
+                        if (WorldZone.GetZoneOfPoint(at)?.id == "zombie_sawmill" && spots.All(o => (o - at).magnitude > 150f)) spots.Add(at);
+                        if (spots.Count == 2) break;
+                    }
+                Bot.Require("room in the sawmill", spots.Count == 2);
+                var station = WorldMap.SpawnWGO(MainGame.me.world_root, "porter_station", (Vector3)spots[0]);
+                var box = WorldMap.SpawnWGO(MainGame.me.world_root, "mf_timber_1", (Vector3)spots[1]);
+                yield return Bot.Wait(1f);
+                Bot.Require("station and timber pile in the sawmill", station?.GetMyWorldZone()?.id == "zombie_sawmill" && box?.GetMyWorldZone()?.id == "zombie_sawmill",
+                            $"station zone={station?.GetMyWorldZone()?.id} box zone={box?.GetMyWorldZone()?.id}");
+                var wdef = GameBalance.me.GetData<ItemDefinition>("wood");
+                Bot.Step($"info wood: stack={wdef.stack_count} big={wdef.is_big} crate={wdef.is_crate}");
+                int put = 0;
+                for (int i = 0; i < wood; i++) if (box.AddToInventory(new Item("wood", 1))) put++;
+                bool added = put == wood;
+                Bot.Step($"info timber pile {box.obj_id}#{box.unique_id} added={added} inv=[{Items(box.data.inventory)}] size={box.obj_def.inventory_size} zone={box.GetMyWorldZone()?.id}");
+                Bot.Step($"info station {station.obj_id}#{station.unique_id} dst={station.porter_station?.destination?.id}; " + WoodDigest(station.unique_id));
+                Bot.Publish("station", station.unique_id.ToString());
+                yield return Bot.WaitRemote(2, "station_seen", "1", 60f);
+                string start = WoodDigest(station.unique_id);
+                Bot.Publish("start", start);
+                yield return Bot.WaitRemote(2, "start_seen", "1", 60f);
+
+                var def = GameBalance.me.workers_data.FirstOrDefault(d => d.id.Contains("zombie")) ?? GameBalance.me.workers_data.First(d => d.id != "worker_invisible");
+                var z = WorldMap.SpawnWGO(MainGame.me.world_root, def.worker_wgo, (Vector3)(station.pos + new Vector2(0f, -96f)));
+                MainGame.me.save.workers.CreateNewWorker(z, def.id, MainGame.me.save.GenerateBody(1, 3)).UpdateWorkerLevel();
+                var dock = station.GetAvailableDockPointForZombie();
+                if (dock != null) { z.transform.position = dock.transform.position; z.RefreshPositionCache(); }
+                station.linked_worker = z;
+                station.porter_station.state = PorterStation.PorterState.Waiting;   // what the game sets when it docks a worker
+                z.SetParam("is_disabled", 0f);
+                Bot.Step($"info porter on duty: {PorterInfo(station.unique_id)} dock={dock != null}");
+                Bot.Publish("porter", z.unique_id.ToString());
+
+                yield return Bot.WaitUntil("porter set off", () => station.porter_station.state == PorterStation.PorterState.GoingToDestination, 30f);
+                Bot.Step("info set off: " + WoodDigest(station.unique_id) + " " + PorterInfo(station.unique_id));
+                yield return Bot.WaitUntil("porter delivered everything", () => WoodCarried(station.unique_id) == 0 && WoodDigest(station.unique_id).StartsWith("sawmill=0 "), 480f);
+                yield return Bot.Wait(5f);
+                string end = WoodDigest(station.unique_id);
+                Bot.Step("info delivered: " + end + " " + PorterInfo(station.unique_id));
+                Bot.Check("all the wood reached the wood storage", end.StartsWith("sawmill=0 ") && end.Contains("carried=0"), $"{start} -> {end}");
+                int Mf(string d) => int.Parse(d.Split(' ')[1].Substring("mf_wood=".Length));
+                Bot.Check("delivered once", Mf(end) == Mf(start) + wood, $"{start} -> {end}");
+                Bot.Publish("end", end);
+                yield return Bot.WaitRemote(2, "compared", "1", 90f);
+            }
+            else
+            {
+                yield return Bot.WaitUntil("host built a station", () => Bot.Remote(1, "station") != null, 90f);
+                long sid = long.Parse(Bot.Remote(1, "station"));
+                yield return Bot.WaitUntil("the station is here", () => WorldMap.GetWorldGameObjectByUniqueId(sid, false) != null, 30f);
+                Bot.Publish("station_seen", "1");
+                yield return Bot.WaitUntil("host's starting wood", () => Bot.Remote(1, "start") != null, 60f);
+                string start = Bot.Remote(1, "start");
+                yield return Bot.WaitUntil("the same wood here", () => WoodDigest(sid) == start, 30f);
+                Bot.Step("info start here: " + WoodDigest(sid));
+                Bot.Publish("start_seen", "1");
+                yield return Bot.WaitUntil("host's porter", () => Bot.Remote(1, "porter") != null, 60f);
+                string trail = "";
+                int maxMf = 0;
+                float t0 = UnityEngine.Time.realtimeSinceStartup;
+                while (Bot.Remote(1, "end") == null && UnityEngine.Time.realtimeSinceStartup - t0 < 560f)
+                {
+                    string d = WoodDigest(sid);
+                    if (!trail.EndsWith(d)) trail += " > " + d;
+                    int mfHere = int.Parse(d.Split(' ')[1].Substring("mf_wood=".Length));
+                    maxMf = Math.Max(maxMf, mfHere);
+                    yield return Bot.Wait(0.25f);
+                }
+                Bot.Step("info wood here over time:" + trail);
+                int mfStart = int.Parse(start.Split(' ')[1].Substring("mf_wood=".Length));
+                Bot.Check("never more wood in the storage here than was carried", maxMf <= mfStart + wood, $"max {maxMf}, start {mfStart} + {wood}");
+                Bot.Step("info porter here: " + PorterInfo(sid));
+                string end = Bot.Remote(1, "end");
+                string Places(string d) => d.Substring(0, d.IndexOf(" carried="));
+                yield return Bot.WaitUntil("the same wood here at the end (sawmill and storage)", () => Places(WoodDigest(sid)) == Places(end), 30f);
+                long zid = long.Parse(Bot.Remote(1, "porter"));
+                var zHere = WorldMap.GetWorldGameObjectByUniqueId(zid, false);
+                Bot.Check("the porter zombie exists here", zHere != null && !zHere.is_removed, PorterInfo(sid));
+                Bot.Check("the station has its porter here", WorldMap.GetWorldGameObjectByUniqueId(sid, false)?.linked_worker?.unique_id == zid, PorterInfo(sid));
+                Bot.Step("info end here: " + WoodDigest(sid));
+                Bot.Publish("compared", "1");
+            }
+        }
+
+        private static int WoodCarried(long sid) =>
+            WorldMap.GetWorldGameObjectByUniqueId(sid, false)?.linked_worker?.worker?.GetBackpack()?.inventory?.Where(i => i?.id == "wood").Sum(i => i.value) ?? 0;
 
         private static string SermonState()
         {
@@ -255,7 +418,7 @@ namespace CoopQA
         }
 
         private static string GardenInfo(WorldGameObject w) => w == null ? "none" :
-            $"{w.obj_id}#{w.unique_id} crafting={w.components?.craft?.is_crafting} craft={w.components?.craft?.current_craft?.id} progress={F(w.progress)} hp={F(w.hp)}";
+            $"{w.obj_id}#{w.unique_id} crafting={w.components?.craft?.is_crafting} craft={w.components?.craft?.current_craft?.id} progress={F(w.progress)} hp={F(w.hp)} inv=[{string.Join(",", w.data.inventory.Select(i => i.id + "x" + i.value))}]";
 
         /// <summary>A garden bed through a season: the client plants wheat, the host sees it grow
         /// (fast-forwarded on the host, which runs the world), both see it ripen, the client
@@ -332,9 +495,17 @@ namespace CoopQA
                 var w = bed(uid);
                 yield return Bot.WaitUntil("it is growing", () => w != null && w.components.craft.is_crafting &&
                                                                   (w.components.craft.current_craft?.id ?? "").EndsWith("_growing"), 20f);
-                Bot.Step("info growing: " + GardenInfo(w));
-                if (w != null) w.progress = 0.999f;
-                yield return Bot.WaitUntil("ripe here", () => bed(uid)?.obj_id == "garden_wheat_ready", 30f);
+                Bot.Step($"info growing: {GardenInfo(w)} auto={w.components.craft.current_craft?.is_auto} hidden={w.components.craft.current_craft?.hidden}");
+                // Fast-forward the growth. The craft can rewind a progress set from outside
+                // (it keeps its own timing), so keep nudging it until the bed ripens.
+                yield return Bot.WaitUntil("ripe here", () =>
+                {
+                    var b = bed(uid);
+                    if (b == null) return false;
+                    if (b.obj_id == "garden_wheat_ready") return true;
+                    if (b.components.craft.is_crafting && b.progress < 0.999f) b.progress = 0.999f;
+                    return false;
+                }, 30f);
                 Bot.Publish("grown", "1");
                 Vector2 at = bed(uid)?.pos ?? me.pos;
                 Func<int> hostCrop = () => me.data.GetTotalCount("wheat_crop", true) +
@@ -1435,7 +1606,7 @@ namespace CoopQA
                                         .OrderBy(w => (w.pos - MainGame.me.player.pos).sqrMagnitude).FirstOrDefault();
                 if (exit != null)
                 {
-                    yield return WalkUpTo(exit, 120f);
+                    yield return ReachExit(exit);
                     yield return FakeInput.Press(GameKey.Interaction);
                 }
                 yield return Bot.WaitUntil("left the dungeon", () => !InDungeon(), 20f);
@@ -1633,6 +1804,64 @@ namespace CoopQA
 
 
         // ------------------------------------------------------------------ trading
+        /// <summary>Every vendor's money and stock, in uid order.</summary>
+        private static Dictionary<string, string> VendorsByUid(string digest) =>
+            System.Text.RegularExpressions.Regex.Matches(digest, @"(\d+):(money=\S+ stock=\[[^\]]*\])")
+                .Cast<System.Text.RegularExpressions.Match>()
+                .ToDictionary(m => m.Groups[1].Value, m => m.Groups[2].Value);
+
+        private static string VendorsDigest() => string.Join(" ", WorldMap.objs
+            .Where(o => o != null && !o.is_removed && o.vendor != null)
+            .OrderBy(o => o.unique_id)
+            .Select(o => o.unique_id + ":" + VendorState(o)).ToArray());
+
+        /// <summary>The end of a day: vendors earn their income and restock (random amounts).
+        /// It runs once, on the host, and both sides then see the same vendors.</summary>
+        private static IEnumerator VendorDayEnd()
+        {
+            if (Bot.IsHost)
+            {
+                string before = VendorsDigest();
+                Bot.Publish("vendors_before", before);
+                yield return Bot.WaitRemote(2, "vendors_before_seen", "1", 30f);
+                WorldMap.VendorsTradeWithBank();   // what the game does at the end of the day
+                string after = VendorsDigest();
+                Bot.Check("the vendors traded with the bank", after != before, "no vendor changed");
+                Bot.Publish("vendors", after);
+                yield return Bot.WaitRemote(2, "vendors_same", "1", 60f);
+            }
+            else
+            {
+                yield return Bot.WaitUntil("host's vendors before", () => Bot.Remote(1, "vendors_before") != null, 30f);
+                string before = VendorsDigest();
+                {
+                    var host0 = VendorsByUid(Bot.Remote(1, "vendors_before"));
+                    var mine0 = VendorsByUid(before);
+                    var diff0 = host0.Where(kv => !mine0.ContainsKey(kv.Key) || mine0[kv.Key] != kv.Value).ToList();
+                    Bot.Step($"info before the day end {diff0.Count} of {host0.Count} vendors differ: " + string.Join(" | ",
+                        diff0.Select(kv => kv.Key + " here " + (mine0.TryGetValue(kv.Key, out var m0) ? m0 : "missing") + " host " + kv.Value).ToArray()));
+                }
+                Bot.Publish("vendors_before_seen", "1");
+                yield return Bot.WaitUntil("host's day ended", () => Bot.Remote(1, "vendors") != null, 60f);
+                string theirs = Bot.Remote(1, "vendors");
+                yield return Bot.WaitUntil("the same vendors here", () => VendorsDigest() == theirs, 30f);
+                if (VendorsDigest() != theirs)
+                {
+                    var host = VendorsByUid(theirs);
+                    var mine = VendorsByUid(VendorsDigest());
+                    Bot.Step($"info {host.Count(kv => !mine.ContainsKey(kv.Key) || mine[kv.Key] != kv.Value)} of {host.Count} vendors differ: " + string.Join(" | ",
+                        host.Where(kv => !mine.ContainsKey(kv.Key) || mine[kv.Key] != kv.Value)
+                            .Select(kv => kv.Key + " here " + (mine.TryGetValue(kv.Key, out var m) ? m : "missing") + " host " + kv.Value).ToArray()));
+                }
+                // The client's own end of day must not run: it would restock with other numbers.
+                WorldMap.VendorsTradeWithBank();
+                yield return Bot.Wait(1f);
+                Bot.Check("my end of day leaves the vendors alone", VendorsDigest() == theirs, "changed after a local end of day");
+                Bot.Check("the vendors changed", theirs != before, "same as before");
+                Bot.Publish("vendors_same", "1");
+            }
+        }
+
         private static string VendorState(WorldGameObject w) =>
             w?.data == null ? "none" : $"money={F(w.data.GetParam("money"))} stock=[{Items(w.data.inventory)}]";
 
@@ -1809,7 +2038,7 @@ namespace CoopQA
                 Bot.Check("found the dungeon exit", exit != null);
                 if (exit != null)
                 {
-                    yield return WalkUpTo(exit, 120f);
+                    yield return ReachExit(exit);
                     Bot.Step($"info at the exit: nearest={me.components.interaction.nearest?.obj_id}");
                     yield return FakeInput.Press(GameKey.Interaction);
                     yield return Bot.WaitUntil("left the dungeon", () => !InDungeon(), 20f);
@@ -2005,7 +2234,7 @@ namespace CoopQA
                 Bot.Check("found the dungeon exit", exit != null);
                 if (exit != null)
                 {
-                    yield return WalkUpTo(exit, 120f);
+                    yield return ReachExit(exit);
                     yield return FakeInput.Press(GameKey.Interaction);
                     yield return Bot.WaitUntil("left the dungeon", () => !InDungeon(), 20f);
                 }
@@ -2134,7 +2363,7 @@ namespace CoopQA
                 Bot.Check("found the dungeon exit", exit != null);
                 if (exit != null)
                 {
-                    yield return WalkUpTo(exit, 120f);
+                    yield return ReachExit(exit);
                     yield return FakeInput.Press(GameKey.Interaction);
                     yield return Bot.WaitUntil("left the dungeon", () => !InDungeon(), 20f);
                 }
@@ -2464,6 +2693,37 @@ namespace CoopQA
 
         /// <summary>Teleport near the target, then walk into it from each side (keyboard
         /// walking) until the game highlights it as the object in front of the player.</summary>
+        /// <summary>Walk up to the dungeon exit until it is the thing the action key uses: a
+        /// bat hovering next to it can be nearer, so step back and try again a few times.</summary>
+        private static IEnumerator ReachExit(WorldGameObject exit)
+        {
+            var inter = MainGame.me.player.components.interaction;
+            float[] distances = { 120f, 60f, 30f };
+            for (int attempt = 0; attempt < 9; attempt++)
+            {
+                yield return WalkUpTo(exit, distances[attempt % distances.Length]);
+                if (inter.nearest == exit) yield break;
+                var me = MainGame.me.player;
+                var blocker = inter.nearest;
+                Bot.Step($"info exit blocked by {blocker?.obj_id}; trying again " +
+                         $"me={me.pos.x:0};{me.pos.y:0} exit={exit.pos.x:0};{exit.pos.y:0} " +
+                         $"enabled={GS.IsPlayerEnable()} inter={inter.enabled} " +
+                         $"blocker={blocker?.unique_id}@{(blocker != null ? blocker.pos.x.ToString("0") + ";" + blocker.pos.y.ToString("0") : "-")} " +
+                         $"inDungeonRoot={(blocker != null && MainGame.me.dungeon_root != null && blocker.transform.IsChildOf(MainGame.me.dungeon_root.transform))}");
+                // A wandering dungeon monster stuck in the exit doorway (its pathfinding
+                // gives up there) blocks the walk and takes the interaction. The test is
+                // about leaving, not fighting: move it out of the way.
+                if (blocker != null && blocker != exit && blocker.obj_def != null &&
+                    blocker.obj_def.type == ObjectDefinition.ObjType.Mob)
+                {
+                    Vector2 away = ((Vector2)blocker.pos - (Vector2)exit.pos);
+                    if (away.sqrMagnitude < 1f) away = Vector2.right;
+                    blocker.PlaceAtPos((Vector2)exit.pos + away.normalized * 400f);
+                }
+                yield return Bot.Wait(1.5f);
+            }
+        }
+
         private static IEnumerator WalkUpTo(WorldGameObject target, float from = 200f)
         {
             var me = MainGame.me.player;

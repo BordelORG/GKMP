@@ -60,6 +60,7 @@ namespace GraveyardKeeperCoop.Multiplayer
         // sequence they already include, so such entries are recognised and skipped.
         private readonly Dictionary<string, KeyValuePair<uint, float>> inFlightWgoStates =
             new Dictionary<string, KeyValuePair<uint, float>>();
+        private readonly HashSet<string> skippedOlderEntries = new HashSet<string>();
         // A host that never confirms (it dropped the packet) regains authority after this.
         private const float InFlightWgoExpirySeconds = 10f;
         private readonly Dictionary<long, uint> chestRevisions = new Dictionary<long, uint>();
@@ -347,6 +348,7 @@ namespace GraveyardKeeperCoop.Multiplayer
                 return;
             if (wgo != null && !ShouldSyncWgo(wgo))
                 return;
+            NoteIfOffscreen(wgo);
 
             MarkLocallyMutated(wgo);
             SendImmediateSnapshot(force);
@@ -360,6 +362,7 @@ namespace GraveyardKeeperCoop.Multiplayer
             WorldGameObject owner = FindWgoByData(data);
             if (owner != null && !ShouldSyncWgo(owner))
                 return;
+            NoteIfOffscreen(owner);
 
             MarkLocallyMutated(owner);
             SendImmediateSnapshot(force);
@@ -1507,10 +1510,14 @@ namespace GraveyardKeeperCoop.Multiplayer
                 // another full fingerprint pass to "save" one.
                 uint hostAppliedMine = 0U;
                 snapshot.AppliedSequences?.TryGetValue(GetLocalSteamId(), out hostAppliedMine);
+                skippedOlderEntries.Clear();
                 for (int i = 0; i < snapshot.WgoEntries.Count; i++)
                 {
                     if (IsOlderThanInFlightState(snapshot.WgoEntries[i], hostAppliedMine))
+                    {
+                        skippedOlderEntries.Add(snapshot.WgoEntries[i].Key);
                         continue;
+                    }
                     ApplyWgoEntry(snapshot.WgoEntries[i]);
                 }
 
@@ -1586,8 +1593,14 @@ namespace GraveyardKeeperCoop.Multiplayer
             for (int i = 0; i < snapshot.WgoEntries.Count; i++)
             {
                 InventoryWgoEntry entry = snapshot.WgoEntries[i];
+                // A skipped older entry is not the host's state any more: keep the
+                // baseline at what was sent, or the local state looks changed against
+                // it and goes back to the host, undoing the host's newer changes.
+                if (skippedOlderEntries.Contains(entry.Key))
+                    continue;
                 hostBaselineWgoFingerprints[entry.Key] = entry.Fingerprint;
             }
+            skippedOlderEntries.Clear();
 
             if (snapshot.IsFull || snapshot.HasDrops)
             {
@@ -2000,6 +2013,16 @@ namespace GraveyardKeeperCoop.Multiplayer
                 AppendCheapFingerprint(entries, wgo);
             }
 
+            if (OffscreenMutated.Count > 0)
+            {
+                foreach (WorldGameObject wgo in OffscreenMutated)
+                {
+                    if (wgo != null && !wgo.is_removed && !EligibleWgoCache.Contains(wgo))
+                        AppendCheapFingerprint(entries, wgo);
+                }
+                OffscreenMutated.Clear();
+            }
+
             if (!capturedLocalPlayer && MainGame.me?.player != null && ShouldSyncWgo(MainGame.me.player))
             {
                 AppendCheapFingerprint(entries, MainGame.me.player);
@@ -2007,6 +2030,19 @@ namespace GraveyardKeeperCoop.Multiplayer
 
             entries.Sort((a, b) => string.CompareOrdinal(a.Key, b.Key));
             return entries;
+        }
+
+        // GKMP: objects changed while asleep (far from both players): a zombie porter
+        // filling a distant storage. Only active objects are captured, so such a change
+        // reached the partner only once someone walked there; a partner standing there
+        // meanwhile worked on the old contents and could send them back over the new.
+        // Objects named here are captured once even though they are inactive.
+        private static readonly HashSet<WorldGameObject> OffscreenMutated = new HashSet<WorldGameObject>();
+
+        private static void NoteIfOffscreen(WorldGameObject wgo)
+        {
+            if (wgo != null && !wgo.is_removed && !IsActiveNearPlayer(wgo))
+                OffscreenMutated.Add(wgo);
         }
 
         private static bool IsActiveNearPlayer(WorldGameObject wgo)
@@ -2096,14 +2132,21 @@ namespace GraveyardKeeperCoop.Multiplayer
             try
             {
                 var res = ItemParamsField?.GetValue(data) as GameRes;
-                var keys = res == null ? null : ResTypeField?.GetValue(res) as List<string>;
-                if (keys == null || keys.Count == 0)
+                if (res == null)
                     return string.Empty;
+                // A vendor's purse is GameRes.money, a field of its own: it is not among
+                // the named params, so a day's income (stock unchanged) was never sent.
+                string money = Math.Abs(res.money) > 0.0001f
+                    ? "$" + Math.Round(res.money, 2) + ","
+                    : string.Empty;
+                var keys = ResTypeField?.GetValue(res) as List<string>;
+                if (keys == null || keys.Count == 0)
+                    return money;
                 // NPCs change walking params all the time (on_the_way, speed): for them only
                 // money counts (a vendor's purse), or their inventory is resent constantly.
                 bool npc = false;
                 try { npc = GameBalance.me?.GetDataOrNull<ObjectDefinition>(data.id)?.IsNPC() == true; } catch { }
-                var sb = new StringBuilder(keys.Count * 16);
+                var sb = new StringBuilder(money, keys.Count * 16 + money.Length);
                 for (int i = 0; i < keys.Count; i++)
                 {
                     if (npc && keys[i] != "money")

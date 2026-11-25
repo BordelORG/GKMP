@@ -36,11 +36,13 @@ namespace GraveyardKeeperCoop.Patches
             }
         }
 
-        /// <summary>A client-side script adding to an object's own params (a sermon
-        /// visitor dropping money in the donation box) is a local change like an item
-        /// moving: mark it so a host snapshot that predates it cannot overwrite it before
-        /// it is sent. Players and NPCs are skipped (their params churn constantly and
-        /// are synced by their own systems).</summary>
+        /// <summary>A script adding to an object's own params (a sermon visitor dropping
+        /// money in the donation box) is a change like an item moving. On a client it is
+        /// marked so a host snapshot that predates it cannot overwrite it before it is
+        /// sent; on the host it is sent even when the object is outside the active chunks
+        /// (the box usually is while the preacher stands at the pulpit, so the partner
+        /// saw the donations only much later). Players and NPCs are skipped (their params
+        /// churn constantly and are synced by their own systems).</summary>
         [HarmonyPatch(typeof(WorldGameObject), nameof(WorldGameObject.AddToParams), new Type[] { typeof(string), typeof(float) })]
         [HarmonyPostfix]
         private static void WorldGameObject_AddToParams_Postfix(
@@ -53,11 +55,95 @@ namespace GraveyardKeeperCoop.Patches
                 return;
             }
             var onlineCoop = GraveyardKeeperCoop.Network.OnlineCoopManager.Instance;
-            if (onlineCoop == null || !onlineCoop.IsOnlineCoopEnabled || onlineCoop.IsHost)
+            if (onlineCoop == null || !onlineCoop.IsOnlineCoopEnabled)
                 return;
             if (__instance.obj_def == null || __instance.obj_def.IsNPC())
                 return;
             InventorySync.Instance?.NotifyInventoryMutated(__instance);
+        }
+
+        /// <summary>Porters run on the host only. The station's state reaches the client by
+        /// sync, and a client seeing "waiting" with a docked zombie would load its own copy
+        /// of the source storages and deliver the same goods a second time.</summary>
+        [HarmonyPatch(typeof(PorterStation), "TrySendPorter")]
+        [HarmonyPrefix]
+        private static bool PorterStation_TrySendPorter_Prefix(ref bool __result)
+        {
+            if (!IsOnlineClient()) return true;
+            __result = false;
+            return false;
+        }
+
+        [HarmonyPatch(typeof(PorterStation), nameof(PorterStation.OnCameToDestination))]
+        [HarmonyPrefix]
+        private static bool PorterStation_OnCameToDestination_Prefix() => !IsOnlineClient();
+
+        [HarmonyPatch(typeof(PorterStation), nameof(PorterStation.OnCameToSource))]
+        [HarmonyPrefix]
+        private static bool PorterStation_OnCameToSource_Prefix() => !IsOnlineClient();
+
+        private static bool IsOnlineClient()
+        {
+            var onlineCoop = GraveyardKeeperCoop.Network.OnlineCoopManager.Instance;
+            return onlineCoop != null && onlineCoop.IsOnlineCoopEnabled && !onlineCoop.IsHost;
+        }
+
+        /// <summary>At the end of each day every vendor trades with the "bank": it earns
+        /// its daily income and restocks or sells off goods, with random amounts. Both
+        /// peers ran it on their own, so a vendor ended up with different stock and money
+        /// on each side (and a purchase made just before was undone). The host runs it and
+        /// sends each vendor's stock and money; a client skips it.</summary>
+        [HarmonyPatch(typeof(WorldMap), nameof(WorldMap.VendorsTradeWithBank))]
+        [HarmonyPrefix]
+        private static bool WorldMap_VendorsTradeWithBank_Prefix()
+        {
+            return !IsOnlineClient();
+        }
+
+        [HarmonyPatch(typeof(WorldMap), nameof(WorldMap.VendorsTradeWithBank))]
+        [HarmonyPostfix]
+        private static void WorldMap_VendorsTradeWithBank_Postfix()
+        {
+            var onlineCoop = GraveyardKeeperCoop.Network.OnlineCoopManager.Instance;
+            if (onlineCoop == null || !onlineCoop.IsOnlineCoopEnabled || !onlineCoop.IsHost ||
+                InventorySync.Instance == null || WorldMap.objs == null)
+                return;
+            int reported = 0;
+            for (int i = 0; i < WorldMap.objs.Count; i++)
+            {
+                WorldGameObject wgo = WorldMap.objs[i];
+                if (wgo == null || wgo.is_removed || wgo.vendor == null)
+                    continue;
+                InventorySync.Instance.NotifyInventoryMutated(wgo);
+                reported++;
+            }
+            CoopMod.Logger.LogInfo($"[InventorySync] End of day: sending {reported} vendors' stock and money");
+        }
+
+        /// <summary>A porter loads its backpack by editing the source storages' item lists
+        /// directly (no AddItem/RemoveItem), so report those storages after it sets off.</summary>
+        [HarmonyPatch(typeof(PorterStation), "TrySendPorter")]
+        [HarmonyPostfix]
+        private static void PorterStation_TrySendPorter_Postfix(PorterStation __instance, bool __result)
+        {
+            if (!__result || InventorySync.Instance == null)
+                return;
+            try
+            {
+                var inventories = __instance.source?.GetMultiInventory();
+                if (inventories == null)
+                    return;
+                for (int i = 0; i < inventories.Count; i++)
+                {
+                    WorldGameObject owner = InventorySync.FindWgoByData(inventories[i]?.data);
+                    if (owner != null)
+                        InventorySync.Instance.NotifyInventoryMutated(owner);
+                }
+            }
+            catch (Exception e)
+            {
+                CoopMod.Logger.LogWarning($"[InventorySync] Porter source report failed: {e.Message}");
+            }
         }
 
         [HarmonyPatch(typeof(Item), "AddItem", new Type[]

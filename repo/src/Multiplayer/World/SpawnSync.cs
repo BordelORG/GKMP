@@ -203,6 +203,7 @@ namespace GraveyardKeeperCoop.Multiplayer
             sentCutsceneActorSpawns.Clear();
             cutsceneActorClaims.Clear();
             cutsceneActorByRequest.Clear();
+            recentHostReplacements.Clear();
             lastPuffFxRelayAt.Clear();
             lastBishopStockBroadcastAt.Clear();
             nextTemporaryPlacementId = TemporaryPlacementIdMax;
@@ -218,6 +219,7 @@ namespace GraveyardKeeperCoop.Multiplayer
             sentCutsceneActorSpawns.Clear();
             cutsceneActorClaims.Clear();
             cutsceneActorByRequest.Clear();
+            recentHostReplacements.Clear();
             lastPuffFxRelayAt.Clear();
             lastBishopStockBroadcastAt.Clear();
             nextTemporaryPlacementId = TemporaryPlacementIdMax;
@@ -785,6 +787,17 @@ namespace GraveyardKeeperCoop.Multiplayer
             if (!IsHost) return;
             if (newWgo == null) return;
 
+            if (recentHostReplacements.Count > 256)
+            {
+                float cutoff = Time.realtimeSinceStartup - DuplicateReplacementSeconds;
+                var stale = new List<long>();
+                foreach (var pair in recentHostReplacements)
+                    if (pair.Value.Value < cutoff) stale.Add(pair.Key);
+                for (int i = 0; i < stale.Count; i++)
+                    recentHostReplacements.Remove(stale[i]);
+            }
+            recentHostReplacements[newWgo.unique_id] =
+                new KeyValuePair<string, float>(newWgo.obj_id, Time.realtimeSinceStartup);
             if (!TrySerializeWgo(newWgo, out string json)) return;
             byte[] jsonBytes = Encoding.UTF8.GetBytes(json);
 
@@ -3234,6 +3247,24 @@ namespace GraveyardKeeperCoop.Multiplayer
                 replacement.Serialized = remapped;
             }
 
+            // A client that ran the same change itself (a bed ripening from the host's
+            // growth progress) asks for what the host has just done. Applying it again
+            // destroys and recreates the object on both sides, which drops whatever a
+            // player was doing with it.
+            WorldGameObject current = WorldMap.GetWorldGameObjectByUniqueId(replacement.OldUniqueId, false);
+            if (current != null &&
+                replacement.NewUniqueId == replacement.OldUniqueId &&
+                current.obj_id == replacement.ObjId &&
+                recentHostReplacements.TryGetValue(current.unique_id, out var recent) &&
+                recent.Key == replacement.ObjId &&
+                Time.realtimeSinceStartup - recent.Value < DuplicateReplacementSeconds)
+            {
+                CoopMod.Logger.LogInfo(
+                    $"{LogPrefix} Ignored duplicate client replacement from {senderID}: " +
+                    $"uid={current.unique_id} is already {current.obj_id}");
+                return;
+            }
+
             WorldGameObject target =
                 ApplyWgoReplacement(replacement, "client request");
             if (target == null)
@@ -3245,6 +3276,10 @@ namespace GraveyardKeeperCoop.Multiplayer
                 $"old_uid={replacement.OldUniqueId}, " +
                 $"new_uid={target.unique_id}, obj_id={target.obj_id}");
         }
+
+        private const float DuplicateReplacementSeconds = 5f;
+        private readonly Dictionary<long, KeyValuePair<string, float>> recentHostReplacements =
+            new Dictionary<long, KeyValuePair<string, float>>();
 
         private sealed class WgoReplacement
         {

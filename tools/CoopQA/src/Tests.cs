@@ -106,8 +106,33 @@ namespace CoopQA
             foreach (var gui in BaseGUI.opened_windows.ToList())
             {
                 if (gui == null || gui == GUIElements.me.sleep_gui || gui == GUIElements.me.main_menu) continue;
+                // A game dialog (a scene asking the player something) waits for its answer:
+                // hiding it skips the button callback and leaves the scene holding the
+                // player. Press the first button instead, like a player would.
+                if (gui is DialogGUI dialog && PressFirstDialogButton(dialog))
+                {
+                    Bot.Step($"     answered leftover dialog '{dialog.label_1?.text}'");
+                    continue;
+                }
                 try { gui.Hide(); Bot.Step("     closed leftover window " + gui.GetType().Name); }
                 catch (System.Exception e) { Bot.Step($"     could not close {gui.GetType().Name}: {e.Message}"); }
+            }
+        }
+
+        private static bool PressFirstDialogButton(DialogGUI dialog)
+        {
+            try
+            {
+                var buttons = HarmonyLib.AccessTools.Field(typeof(DialogGUI), "_dialog_buttons").GetValue(dialog);
+                var delegates = (System.Collections.IList)HarmonyLib.AccessTools.Field(buttons.GetType(), "_delegates").GetValue(buttons);
+                if (delegates == null || delegates.Count == 0 || delegates[0] == null) return false;
+                ((GJCommons.VoidDelegate)delegates[0]).Invoke();
+                return true;
+            }
+            catch (System.Exception e)
+            {
+                Bot.Step($"     could not answer DialogGUI: {e.Message}");
+                return false;
             }
         }
 

@@ -39,6 +39,7 @@ namespace GraveyardKeeperCoop.Multiplayer
 
         private void LateUpdate()
         {
+            RetryPendingLinks();
             if (dirtyBenches.Count == 0) return;
             var batch = new List<KeyValuePair<long, long>>(dirtyBenches);
             dirtyBenches.Clear();
@@ -87,22 +88,72 @@ namespace GraveyardKeeperCoop.Multiplayer
             bool oldDisabled = reader.ReadBoolean();
             var oldPos = new Vector2(reader.ReadSingle(), reader.ReadSingle());
 
-            var bench = WorldMap.GetWorldGameObjectByUniqueId(benchUid, false);
-            var worker = workerUid > 0 ? WorldMap.GetWorldGameObjectByUniqueId(workerUid, false) : null;
-            var old = oldUid > 0 ? WorldMap.GetWorldGameObjectByUniqueId(oldUid, false) : null;
+            var link = new PendingLink
+            {
+                BenchUid = benchUid, WorkerUid = workerUid, WorkerDisabled = workerDisabled, WorkerPos = workerPos,
+                OldUid = oldUid, OldDisabled = oldDisabled, OldPos = oldPos, Sender = senderID,
+                Until = Time.realtimeSinceStartup + PendingLinkSeconds
+            };
+            pendingLinks.Remove(benchUid);   // a newer link for the bench replaces a waiting one
+            if (!TryApplyLink(link, waiting: true))
+            {
+                pendingLinks[benchUid] = link;
+                CoopMod.Logger.LogInfo($"{LogPrefix} WorkerLink bench={benchUid} worker={workerUid} waits for the bench/worker to arrive");
+            }
+        }
+
+        // GKMP: a worker made and docked in one go (a new zombie put on a porter station)
+        // sends its link right behind the spawn. When the link came first the client set the
+        // station to "no worker" for good; it now waits a while for both objects to arrive.
+        private const float PendingLinkSeconds = 30f;
+        private readonly Dictionary<long, PendingLink> pendingLinks = new Dictionary<long, PendingLink>();
+        private float nextPendingLinkTry;
+
+        private sealed class PendingLink
+        {
+            public long BenchUid, WorkerUid, OldUid;
+            public bool WorkerDisabled, OldDisabled;
+            public Vector2 WorkerPos, OldPos;
+            public CSteamID Sender;
+            public float Until;
+        }
+
+        private void RetryPendingLinks()
+        {
+            if (pendingLinks.Count == 0 || Time.realtimeSinceStartup < nextPendingLinkTry) return;
+            nextPendingLinkTry = Time.realtimeSinceStartup + 0.5f;
+            foreach (var link in new List<PendingLink>(pendingLinks.Values))
+            {
+                bool expired = Time.realtimeSinceStartup > link.Until;
+                if (TryApplyLink(link, waiting: !expired) || expired)
+                    pendingLinks.Remove(link.BenchUid);
+            }
+        }
+
+        /// <summary>Applies a link. Returns false (nothing done) while the bench is not here,
+        /// or, when <paramref name="waiting"/>, while the named worker is not here yet.</summary>
+        private bool TryApplyLink(PendingLink link, bool waiting)
+        {
+            var bench = WorldMap.GetWorldGameObjectByUniqueId(link.BenchUid, false);
+            var worker = link.WorkerUid > 0 ? WorldMap.GetWorldGameObjectByUniqueId(link.WorkerUid, false) : null;
+            var old = link.OldUid > 0 ? WorldMap.GetWorldGameObjectByUniqueId(link.OldUid, false) : null;
+            bool workerMissing = link.WorkerUid > 0 && (worker == null || !worker.IsWorker());
             if (bench == null)
             {
-                CoopMod.Logger.LogWarning($"{LogPrefix} WorkerLink for unknown bench uid={benchUid}");
-                return;
+                if (!waiting)
+                    CoopMod.Logger.LogWarning($"{LogPrefix} WorkerLink for unknown bench uid={link.BenchUid}");
+                return false;
             }
+            if (workerMissing && waiting)
+                return false;
             IsApplyingRemoteLink = true;
             try
             {
                 if (old != null)
                 {
-                    PlaceWorker(old, oldPos);
-                    old.SetParam("is_disabled", oldDisabled ? 1f : 0f);
-                    if (oldDisabled)
+                    PlaceWorker(old, link.OldPos);
+                    old.SetParam("is_disabled", link.OldDisabled ? 1f : 0f);
+                    if (link.OldDisabled)
                     {
                         try { old.components.character.SetNoWorkerTool(); old.components.character.StopMovement(); } catch { }
                         try { old.worker?.UpdateWorkerSkin(Worker.WorkerActivity.None); } catch { }
@@ -110,9 +161,9 @@ namespace GraveyardKeeperCoop.Multiplayer
                 }
                 if (worker != null && worker.IsWorker())
                 {
-                    worker.SetParam("is_disabled", workerDisabled ? 1f : 0f);
+                    worker.SetParam("is_disabled", link.WorkerDisabled ? 1f : 0f);
                     if (!worker.gameObject.activeSelf) worker.gameObject.SetActive(true);
-                    PlaceWorker(worker, workerPos);
+                    PlaceWorker(worker, link.WorkerPos);
                     bench.linked_worker = worker;
                 }
                 else
@@ -122,14 +173,15 @@ namespace GraveyardKeeperCoop.Multiplayer
             }
             catch (System.Exception ex)
             {
-                CoopMod.Logger.LogWarning($"{LogPrefix} Failed to apply WorkerLink bench={benchUid}: {ex.Message}");
+                CoopMod.Logger.LogWarning($"{LogPrefix} Failed to apply WorkerLink bench={link.BenchUid}: {ex.Message}");
             }
             finally
             {
                 IsApplyingRemoteLink = false;
             }
-            CoopMod.Logger.LogInfo($"{LogPrefix} Applied WorkerLink: bench={bench.obj_id}#{benchUid} worker={workerUid}{(worker == null && workerUid > 0 ? " (not found)" : "")}");
-            if (IsHost) SendWorkerLink(bench, oldUid, senderID);
+            CoopMod.Logger.LogInfo($"{LogPrefix} Applied WorkerLink: bench={bench.obj_id}#{link.BenchUid} worker={link.WorkerUid}{(workerMissing ? " (not found)" : "")}");
+            if (IsHost) SendWorkerLink(bench, link.OldUid, link.Sender);
+            return true;
         }
 
         protected override string LogPrefix => "[WorkerSync]";

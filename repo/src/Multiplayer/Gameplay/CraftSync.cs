@@ -405,10 +405,29 @@ namespace GraveyardKeeperCoop.Multiplayer
                 ExpireRemoteLease(uniqueId, Time.realtimeSinceStartup);
                 if (remoteCraftAuthority.TryGetValue(uniqueId, out ulong owner))
                 {
-                    CoopMod.Logger.LogWarning(
-                        $"{LogPrefix} Refused to replace remote station owner {owner} " +
-                        $"after a local craft start on {craft.wgo.obj_id} (uid={uniqueId})");
-                    return;
+                    CraftDefinition started = craft.current_craft;
+                    if (started.is_auto || started.hidden)
+                    {
+                        // An automatic craft (a planted bed starting to grow) is the
+                        // world's, not a player's. A lease a player took on the object a
+                        // moment before (still holding the work key while the seedling
+                        // replaced the empty bed) must not keep it: the client then ran
+                        // the growth itself and the host's progress was reset.
+                        RememberReleasedRemoteLease(uniqueId, owner);
+                        remoteCraftAuthority.Remove(uniqueId);
+                        remoteCraftAuthorityExpiresAt.Remove(uniqueId);
+                        IncrementLeaseRevision(uniqueId);
+                        CoopMod.Logger.LogInfo(
+                            $"{LogPrefix} Host automatic craft '{started.id}' on {craft.wgo.obj_id} " +
+                            $"(uid={uniqueId}) took the station back from {owner}");
+                    }
+                    else
+                    {
+                        CoopMod.Logger.LogWarning(
+                            $"{LogPrefix} Refused to replace remote station owner {owner} " +
+                            $"after a local craft start on {craft.wgo.obj_id} (uid={uniqueId})");
+                        return;
+                    }
                 }
             }
 
@@ -1715,6 +1734,9 @@ namespace GraveyardKeeperCoop.Multiplayer
                 return false;
             }
 
+            if (!IsHost && entry.IsCrafting && IsWorldAutoCraft(entry.CurrentCraftId))
+                DropLocalOwnership(wgo.unique_id);
+
             if (!awaitingCanonicalCompletion &&
                 ShouldPreserveLocalCraftState(wgo.unique_id))
             {
@@ -1735,6 +1757,13 @@ namespace GraveyardKeeperCoop.Multiplayer
                 float appliedProgress = sameActiveOperation && !allowProgressReset
                     ? Mathf.Max(wgo.progress, entry.Progress)
                     : entry.Progress;
+                // The host finishes its automatic crafts (a bed ripening) and sends the
+                // result as an object replacement. A client given the finished progress
+                // would finish its own copy too and send a second replacement that races
+                // the host's (the bed was then replaced three times and the player could
+                // not reach it).
+                if (!IsHost && entry.IsCrafting && IsWorldAutoCraft(entry.CurrentCraftId))
+                    appliedProgress = Mathf.Min(appliedProgress, 0.99f);
 
                 var serializable = new SerializableWGO.SerializableCraft
                 {
@@ -1806,6 +1835,31 @@ namespace GraveyardKeeperCoop.Multiplayer
                 CoopMod.Logger.LogWarning($"{LogPrefix} Error applying craft state to {wgo.obj_id}: {ex.Message}");
                 return false;
             }
+        }
+
+        /// <summary>An automatic or hidden craft (a planted bed growing) runs on the host,
+        /// which owns the world. The lease a client took to plant the bed must not make
+        /// the client keep its own copy of the growth and refuse the host's.</summary>
+        private static bool IsWorldAutoCraft(string craftId)
+        {
+            if (string.IsNullOrEmpty(craftId))
+                return false;
+            CraftDefinition definition = GameBalance.me?.GetDataOrNull<CraftDefinition>(craftId);
+            return definition != null && (definition.is_auto || definition.hidden);
+        }
+
+        private void DropLocalOwnership(long uniqueId)
+        {
+            if (!locallyOwnedCrafts.Remove(uniqueId) &&
+                !localAuthorityReleaseAt.Remove(uniqueId) &&
+                !clientStationLeases.Remove(uniqueId))
+            {
+                return;
+            }
+            localAuthorityReleaseAt.Remove(uniqueId);
+            clientStationLeases.Remove(uniqueId);
+            CoopMod.Logger.LogInfo(
+                $"{LogPrefix} Host runs the automatic craft on uid={uniqueId}; dropped the local claim");
         }
 
         private bool ShouldPreserveLocalCraftState(long uniqueId)

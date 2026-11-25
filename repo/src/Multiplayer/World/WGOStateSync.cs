@@ -18,6 +18,9 @@ namespace GraveyardKeeperCoop.Multiplayer
     /// </summary>
     public class WGOStateSync : MonoBehaviour
     {
+        private static readonly System.Reflection.FieldInfo ItemParamsField =
+            HarmonyLib.AccessTools.Field(typeof(Item), "_params");
+
         private const byte PayloadVersion = 1;
         private const byte EnvelopeSnapshot = 0;
         private const byte EnvelopeBegin = 1;
@@ -806,6 +809,17 @@ namespace GraveyardKeeperCoop.Multiplayer
                  secondaryInventory.Count > 0);
             bool wasActive = existing.gameObject.activeSelf;
 
+            // GKMP: InventorySync also owns a container's own params (a donation box's
+            // money, a grave's parts) for objects other than players and NPCs. This
+            // snapshot can be older than them, and restoring its params rolled the box
+            // back; the client then saw the rollback as its own change and sent it to the
+            // host, which lost the donations in between.
+            bool keepParams = redrawPreservedInventory && !existing.is_player &&
+                              existing.obj_def != null && !existing.obj_def.IsNPC();
+            object currentParams = keepParams && currentData != null
+                ? ItemParamsField?.GetValue(currentData)
+                : null;
+
             existing.RestoreFromSerializedObject(serialized, false);
 
             if (currentData != null && existing.data != null)
@@ -814,6 +828,8 @@ namespace GraveyardKeeperCoop.Multiplayer
                 existing.data.inventory = inventory ?? new List<Item>();
                 existing.data.secondary_inventory =
                     secondaryInventory ?? new List<Item>();
+                if (currentParams != null)
+                    ItemParamsField.SetValue(existing.data, currentParams);
             }
 
             if (redrawPreservedInventory)
