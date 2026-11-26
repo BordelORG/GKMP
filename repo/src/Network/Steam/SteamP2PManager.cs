@@ -123,6 +123,7 @@ namespace GraveyardKeeperCoop.Network
         public event Action<CSteamID, byte[]> OnWGOTransformSyncReceived;
         public event Action<CSteamID, byte[]> OnInteractionRequestReceived;
         public event Action<CSteamID, byte[]> OnInteractionZeroHpReceived;
+        public event Action<CSteamID, byte[]> OnNpcHandoffGoToReceived;
         public event Action<CSteamID, byte[]> OnNpcVisualSyncReceived;
         public event Action<CSteamID, byte[]> OnWorkIndicatorSyncReceived;
 
@@ -1497,6 +1498,9 @@ namespace GraveyardKeeperCoop.Network
                     HandleInteractionRequestMessage(senderID, ref reader);
                     break;
 
+                case Op.NpcHandoffGoTo:
+                    HandleSyncPayload(senderID, ref reader, OnNpcHandoffGoToReceived);
+                    break;
                 case Op.InteractionZeroHp:
                     HandleInteractionZeroHpMessage(senderID, ref reader);
                     break;
@@ -2751,6 +2755,15 @@ namespace GraveyardKeeperCoop.Network
         public bool SendInteractionZeroHpToHost(byte[] payload)
         {
             using (var w = new MsgWriter(Op.InteractionZeroHp, (payload?.Length ?? 0) + 8))
+            {
+                w.WriteBytes(payload ?? new byte[0]);
+                return SendToHost(w.ToArray(), EP2PSend.k_EP2PSendReliable);
+            }
+        }
+
+        public bool SendNpcHandoffGoToHost(byte[] payload)
+        {
+            using (var w = new MsgWriter(Op.NpcHandoffGoTo, (payload?.Length ?? 0) + 8))
             {
                 w.WriteBytes(payload ?? new byte[0]);
                 return SendToHost(w.ToArray(), EP2PSend.k_EP2PSendReliable);

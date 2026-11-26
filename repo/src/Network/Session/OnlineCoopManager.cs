@@ -403,6 +403,7 @@ namespace GraveyardKeeperCoop.Network
         // Prevent auto-re-enable immediately after a timeout disconnect
         private float lastTimeoutDisconnectTime = -100f; // Start negative so cooldown doesn't block first enable
         private float stuckControlDisabledSince = -1f;
+        private string stuckControlWaitingFor;
         private const float AUTO_ENABLE_COOLDOWN = 30f; // Seconds to wait before auto-re-enabling after timeout
         
         // Teleport lock - when we explicitly teleport the remote player, ignore incoming positions briefly
@@ -5774,7 +5775,26 @@ namespace GraveyardKeeperCoop.Network
                 }
                 else if (Time.realtimeSinceStartup - stuckControlDisabledSince > 45f)
                 {
-                    CoopMod.Logger.LogWarning("[OnlineCoopManager] Player stuck with control disabled for >45s — force-unlocking (safety net)");
+                    // A scene can hold the player much longer than 45 s (the witch burning
+                    // walks the inquisitor across the map before anyone speaks). While the
+                    // script that took control is still running, it owns the unlock; only
+                    // a lock that outlives its script, or an absurdly long one, is stuck.
+                    float lockedFor = Time.realtimeSinceStartup - stuckControlDisabledSince;
+                    string runningScene = FlowScriptLifetimePatches.RunningScriptStartedSince(
+                        stuckControlDisabledSince - 10f);
+                    if (runningScene != null && lockedFor < 300f)
+                    {
+                        if (stuckControlWaitingFor != runningScene)
+                        {
+                            stuckControlWaitingFor = runningScene;
+                            CoopMod.Logger.LogInfo(
+                                $"[OnlineCoopManager] Control disabled for {lockedFor:F0}s while FlowScript " +
+                                $"\"{runningScene}\" is still running; leaving the unlock to it");
+                        }
+                        return;
+                    }
+                    stuckControlWaitingFor = null;
+                    CoopMod.Logger.LogWarning($"[OnlineCoopManager] Player stuck with control disabled for {lockedFor:F0}s — force-unlocking (safety net)");
                     pc.control_enabled = true;
                     if (pc.player_controlled_by_script)
                         pc.player_controlled_by_script = false;

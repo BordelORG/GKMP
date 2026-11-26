@@ -26,6 +26,12 @@ namespace GraveyardKeeperCoop.Multiplayer
         private readonly Queue<float> recentLocalDestroyBroadcasts = new Queue<float>();
         private float suppressLocalDestroyBroadcastUntil;
 
+        // A burst held back (a scene despawning its eight spectators at once) is sent
+        // afterwards, a few at a time, instead of being dropped: a dropped destroy leaves
+        // the object on the other side forever. A client's goes to the host as usual.
+        private const int MaxDeferredDestroys = 512;
+        private readonly List<long> deferredDestroys = new List<long>();
+
         public static bool IsProcessingRemote => isProcessingRemoteDestroy || WGOStateSync.IsProcessingRemote;
 
         protected override string LogPrefix => "[WGODestructionSync]";
@@ -51,12 +57,14 @@ namespace GraveyardKeeperCoop.Multiplayer
         {
             recentLocalDestroyBroadcasts.Clear();
             suppressLocalDestroyBroadcastUntil = 0f;
+            deferredDestroys.Clear();
         }
 
         protected override void OnSyncDisabled()
         {
             recentLocalDestroyBroadcasts.Clear();
             suppressLocalDestroyBroadcastUntil = 0f;
+            deferredDestroys.Clear();
         }
 
         public void OnLocalWGODestroyed(long uniqueId)
@@ -65,7 +73,19 @@ namespace GraveyardKeeperCoop.Multiplayer
             if (isProcessingRemoteDestroy) return;
             if (!IsOnline) return;
 
-            if (!TryAllowLocalDestroyBroadcast(uniqueId)) return;
+            if (!TryAllowLocalDestroyBroadcast(uniqueId))
+            {
+                // Only a scene's own clean-up is replayed (its script despawning the
+                // actors it spawned). Other bursts, like a dungeon level torn down on
+                // one side while the partner is still in it, must stay local.
+                if (IsLocalSceneRunning() &&
+                    deferredDestroys.Count < MaxDeferredDestroys &&
+                    !deferredDestroys.Contains(uniqueId))
+                {
+                    deferredDestroys.Add(uniqueId);
+                }
+                return;
+            }
 
             if (IsHost)
             {
@@ -76,6 +96,43 @@ namespace GraveyardKeeperCoop.Multiplayer
             {
                 SteamP2PManager.Instance?.SendWGODestroy(uniqueId, toHost: true);
                 CoopMod.Logger.LogDebug($"{LogPrefix} Client sending destroy to host: {uniqueId}");
+            }
+        }
+
+        private static bool IsLocalSceneRunning() =>
+            Patches.CutsceneSyncPatches.HasLocalNpcVisualAuthority() ||
+            Patches.CutsceneSyncPatches.IsAuthoritativeNpcAnimationWindowActive();
+
+        private void Update()
+        {
+            if (!IsSyncEnabled || !IsOnline) return;
+            FlushDeferredDestroys();
+        }
+
+        private void FlushDeferredDestroys()
+        {
+            if (deferredDestroys.Count == 0) return;
+            if (Time.realtimeSinceStartup < suppressLocalDestroyBroadcastUntil) return;
+
+            int sent = 0;
+            while (deferredDestroys.Count > 0 && sent < MaxLocalDestroyBroadcastsPerWindow)
+            {
+                long uniqueId = deferredDestroys[0];
+                deferredDestroys.RemoveAt(0);
+                // Only what is still gone here: the uid may have been reused meanwhile.
+                if (WorldMap.GetWorldGameObjectByUniqueId(uniqueId, false) != null) continue;
+                if (IsHost)
+                    SteamP2PManager.Instance?.BroadcastWGODestroy(uniqueId, null);
+                else
+                    SteamP2PManager.Instance?.SendWGODestroy(uniqueId, toHost: true);
+                sent++;
+            }
+            if (sent > 0)
+            {
+                CoopMod.Logger.LogInfo(
+                    $"{LogPrefix} Sent {sent} held-back destroy(s); {deferredDestroys.Count} still waiting");
+                // Pace the rest like any other burst.
+                suppressLocalDestroyBroadcastUntil = Time.realtimeSinceStartup + LocalDestroyBurstWindowSeconds;
             }
         }
 

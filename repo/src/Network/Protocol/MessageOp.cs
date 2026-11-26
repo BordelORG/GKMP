@@ -116,6 +116,7 @@ namespace GraveyardKeeperCoop.Network
         DebugGiveGrant = 112,     // Host -> target client: grant item on its locally-owned player
         DebugGiveResult = 113,    // Host -> requesting client: request acceptance/rejection notice
         FishingPresentation = 114, // Player-owned fishing pose and passive minigame progress
+        NpcHandoffGoTo = 115,     // Client -> host: where a client's scene sent one of its NPC actors after it ended
 
         // 0xFE and 0xFF are permanently reserved for RNET v2 wire frames and must
         // never be assigned as application Op values.

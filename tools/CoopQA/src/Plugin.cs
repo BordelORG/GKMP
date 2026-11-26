@@ -33,6 +33,13 @@ namespace CoopQA
                 StartCoroutine(HudProbe.Run(Env("QA_OUT", Paths.GameRootPath), Env("QA_SAVE", "1"), Env("QA_LABEL", "probe")));
                 return;
             }
+            if (Environment.GetEnvironmentVariable("QA_TEST") == "solo_scene")
+            {
+                UnityEngine.Application.runInBackground = true;
+                FakeInput.Install(new Harmony("aaa.coopqa"));
+                StartCoroutine(SoloScene.Run(Env("QA_OUT", Paths.GameRootPath), Env("QA_SAVE", "1"), Env("QA_LABEL", "probe"), Env("QA_SCRIPT", "witch_tasty_burning")));
+                return;
+            }
             try
             {
                 Player = int.Parse(Env("QA_PLAYER", "1"));

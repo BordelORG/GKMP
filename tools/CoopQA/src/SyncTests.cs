@@ -36,6 +36,8 @@ namespace CoopQA
             new KeyValuePair<string, Func<IEnumerator>>("combat_host", () => Combat(fighter: 1)),
             new KeyValuePair<string, Func<IEnumerator>>("npc_talk_host", () => NpcTalk(talker: 1)),
             new KeyValuePair<string, Func<IEnumerator>>("npc_talk_client", () => NpcTalk(talker: 2)),
+            new KeyValuePair<string, Func<IEnumerator>>("scene_client", () => Scene(initiator: 2)),
+            new KeyValuePair<string, Func<IEnumerator>>("scene_host", () => Scene(initiator: 1)),
             // Take an organ out of the body on the table: the host the heart, the client the brain.
             new KeyValuePair<string, Func<IEnumerator>>("autopsy_host", () => Craft(1, w => w.is_autopsy_table, c => c.id.EndsWith(":heart"), StartAutopsy)),
             new KeyValuePair<string, Func<IEnumerator>>("autopsy_client", () => Craft(2, w => w.is_autopsy_table, c => c.id.EndsWith(":brain"), StartAutopsy)),
@@ -51,6 +53,8 @@ namespace CoopQA
             new KeyValuePair<string, Func<IEnumerator>>("build_client", () => Build(2)),
             new KeyValuePair<string, Func<IEnumerator>>("workers", Workers),
             new KeyValuePair<string, Func<IEnumerator>>("garden", Garden),
+            new KeyValuePair<string, Func<IEnumerator>>("bees", Bees),
+            new KeyValuePair<string, Func<IEnumerator>>("beehouse", BeeHouse),
             new KeyValuePair<string, Func<IEnumerator>>("sermon", Sermon),
             new KeyValuePair<string, Func<IEnumerator>>("porters", Porters),
             new KeyValuePair<string, Func<IEnumerator>>("dungeon", Dungeon),
@@ -75,6 +79,8 @@ namespace CoopQA
             new KeyValuePair<string, Func<IEnumerator>>("dungeon_probe", DungeonProbe),
             new KeyValuePair<string, Func<IEnumerator>>("days", Days),
             new KeyValuePair<string, Func<IEnumerator>>("garden_probe", GardenProbe),
+            new KeyValuePair<string, Func<IEnumerator>>("bees_probe", BeesProbe),
+            new KeyValuePair<string, Func<IEnumerator>>("scene_probe", SceneProbe),
             new KeyValuePair<string, Func<IEnumerator>>("sermon_probe", SermonProbe),
             new KeyValuePair<string, Func<IEnumerator>>("porter_probe", PorterProbe),
             // Put first in a suite filter: the tests after it run through repeated 4 s link outages.
@@ -101,6 +107,46 @@ namespace CoopQA
             var seeds = GameBalance.me.items_data.Where(i => i.id.Contains("seed")).Select(i => i.id).Take(30);
             Bot.Step("info seed items: " + string.Join(",", seeds));
             Bot.Step("info bag: " + Items(me.data.inventory));
+        }
+
+        private static IEnumerator BeesProbe()
+        {
+            if (!Bot.IsHost) yield break;
+            var me = MainGame.me.player;
+            Func<string, bool> beeish = id => id != null && (id.Contains("bee") || id.Contains("hive") || id.Contains("honey") || id.Contains("wax"));
+            var world = WorldMap.objs.Where(w => w != null && !w.is_removed && beeish(w.obj_id)).OrderBy(w => (w.pos - me.pos).sqrMagnitude).ToList();
+            Bot.Step("info bee objects in the world: " + string.Join(",", world.GroupBy(w => w.obj_id).Select(g => g.Key + "x" + g.Count())));
+            foreach (var w in world.GroupBy(w => w.obj_id).Select(g => g.First()).Take(12))
+            {
+                var crafts = GameBalance.me.craft_data.Where(c => c != null && c.craft_in != null && c.craft_in.Contains(w.obj_id)).Take(6)
+                    .Select(c => $"{c.id}[auto={c.is_auto} hidden={c.hidden} needs={string.Join("+", c.needs.Select(n => n.id + "x" + n.value))} -> {string.Join("+", c.output.Select(o => o.id + "x" + o.value))} vis={MainGame.me.save.IsCraftVisible(c)}]");
+                Bot.Step($"info {w.obj_id}#{w.unique_id} @{V(w.pos)} dist={(w.pos - me.pos).magnitude / 96f:F0}t zone={w.GetMyWorldZone()?.id} interaction={w.obj_def?.interaction_type} has_craft={w.obj_def?.has_craft} " +
+                         $"crafting={w.components?.craft?.is_crafting} craft={w.components?.craft?.current_craft?.id} progress={F(w.progress)} inv=[{Items(w.data.inventory)}] " +
+                         $"tools=[{string.Join(",", w.obj_def?.tool_actions?.action_tools ?? new List<ItemDefinition.ItemType>())}] drop=[{string.Join(",", (w.obj_def?.drop_items ?? new List<Item>()).Select(i => i.id))}] crafts: {string.Join(" ", crafts)}");
+            }
+            Bot.Step("info bee object defs: " + string.Join(",", GameBalance.me.objs_data.Where(o => beeish(o.id)).Select(o => o.id)));
+            Bot.Step("info bee items: " + string.Join(",", GameBalance.me.items_data.Where(i => beeish(i.id)).Select(i => i.id)));
+            foreach (var c in GameBalance.me.craft_data.Where(c => c != null && (beeish(c.id) || c.output.Any(o => beeish(o.id)) || c.needs.Any(n => beeish(n.id)))).Take(30))
+                Bot.Step($"info craft {c.id} in=[{string.Join(",", c.craft_in ?? new List<string>())}] auto={c.is_auto} hidden={c.hidden} needs={string.Join("+", c.needs.Select(n => n.id + "x" + n.value))} -> {string.Join("+", c.output.Select(o => o.id + "x" + o.value))} vis={MainGame.me.save.IsCraftVisible(c)}");
+            foreach (var c in GameBalance.me.craft_obj_data.Where(c => c != null && (beeish(c.id) || c.out_obj != null && beeish(c.out_obj))).Take(10))
+                Bot.Step($"info objcraft {c.id} -> {c.out_obj} builders=[{string.Join(",", c.builder_ids ?? new List<string>())}] needs={string.Join("+", c.needs.Select(n => n.id + "x" + n.value))} vis={MainGame.me.save.IsCraftVisible(c)}");
+        }
+
+        /// <summary>Which multi-NPC story scenes this save could play: where their NPCs are and
+        /// which quests are running.</summary>
+        private static IEnumerator SceneProbe()
+        {
+            if (!Bot.IsHost) yield break;
+            var me = MainGame.me.player;
+            Bot.Step($"info day={MainGame.me.save.day} dow={MainGame.me.save.day_of_week} quests: " +
+                     string.Join(",", MainGame.me.save.quests.GetCurrentQuests().Select(q => q.definition?.id)));
+            foreach (var id in new[] { "npc_inquisitor", "npc_guard_3", "npc_citizen_1", "npc_citizen_2", "npc_citizen_5", "npc_burger_eater_1", "witch_pylon", "vendor_stall",
+                                       "npc_farmer", "npc_farmers_son", "npc_alice", "npc_donkey", "donkey_cart", "npc_bishop", "npc_actress", "npc_actor" })
+            {
+                var ws = WorldMap.objs.Where(w => w != null && !w.is_removed && (w.obj_id == id || w.custom_tag == id)).ToList();
+                Bot.Step($"info {id}: " + (ws.Count == 0 ? "none" : string.Join(" ", ws.Take(3).Select(w => $"{w.obj_id}#{w.unique_id}@{V(w.pos)} tag={w.custom_tag} active={w.gameObject.activeInHierarchy} dist={(w.pos - me.pos).magnitude / 96f:F0}t"))));
+            }
+            yield break;
         }
 
         private static IEnumerator SermonProbe()
@@ -458,7 +504,7 @@ namespace CoopQA
                 Bot.Step("info ripe: " + GardenInfo(bed(uid)) + $" tools=[{string.Join(",", bed(uid)?.obj_def?.tool_actions?.action_tools ?? new List<ItemDefinition.ItemType>())}] interaction={bed(uid)?.obj_def?.interaction_type}");
 
                 // Harvest: stand at it and work (the action key), like a player.
-                string[] crops = { "wheat", "wheat_seed" };
+                string[] crops = { "wheat", "wheat_seed", "wheat_crop", "crop_waste" };   // the harvest is random: crop, seeds or waste
                 Func<int> have = () => crops.Sum(c => me.data.GetTotalCount(c, true));
                 Func<int> dropsNear = () => crops.Sum(c => Drops(c).Count(d => Vector2.Distance(d.transform.position, bed(uid)?.pos ?? me.pos) < 400f));
                 int haveBefore = have(), dropsBefore = dropsNear();
@@ -520,6 +566,420 @@ namespace CoopQA
                           $"{cropBefore} -> {hostCrop()}");
                 Bot.Publish("harvest_seen", "1");
             }
+        }
+
+        private static readonly string[] BeeLoot = { "honey", "bee", "beeswax" };
+
+        /// <summary>A wild hive in a tree: the host runs the world, so it fills the hive
+        /// (fast-forwarded); both see it full; the client takes the honey by hand and gets
+        /// honey, bees and wax once; the host gets nothing and both see the same tree after.</summary>
+        private static IEnumerator Bees()
+        {
+            var me = MainGame.me.player;
+            Func<long, WorldGameObject> tree = uid => WorldMap.GetWorldGameObjectByUniqueId(uid, false);
+            Func<WorldGameObject, bool> full = w => w != null && !w.is_removed && w.obj_id.StartsWith("tree_3_") && w.obj_id.EndsWith("_bees_done");
+            Func<int> loot = () => BeeLoot.Sum(id => me.data.GetTotalCount(id, true));
+            if (Bot.IsHost)
+            {
+                foreach (var id in new[] { "beehouse_place", "beehouse_1", "beehouse_2" })
+                    Bot.Step($"info {id} crafts: " + string.Join(" ", GameBalance.me.craft_data.Where(c => c != null && c.craft_in != null && c.craft_in.Contains(id))
+                        .Select(c => $"{c.id}[auto={c.is_auto} hidden={c.hidden} needs={string.Join("+", c.needs.Select(n => n.id + "x" + n.value))} -> {string.Join("+", c.output.Select(o => o.id + "x" + o.value))} end={c.end_script}]")) +
+                        $" interaction={GameBalance.me.GetDataOrNull<ObjectDefinition>(id)?.interaction_type} tools=[{string.Join(",", GameBalance.me.GetDataOrNull<ObjectDefinition>(id)?.tool_actions?.action_tools ?? new List<ItemDefinition.ItemType>())}]");
+                // A hive that is still filling, nearest first.
+                var hive = WorldMap.objs.Where(w => w != null && !w.is_removed && w.unique_id > 0 && w.obj_id != null && w.obj_id.StartsWith("tree_3_") &&
+                                                    w.obj_id.EndsWith("_bees") && w.components?.craft != null && w.components.craft.is_crafting)
+                                        .OrderBy(w => (w.pos - me.pos).sqrMagnitude).FirstOrDefault();
+                Bot.Check("a wild hive that is filling", hive != null);
+                if (hive == null) { Bot.Publish("hive", "none"); yield break; }
+                long uid = hive.unique_id;
+                Bot.Step("info hive: " + GardenInfo(hive));
+                Bot.Publish("hive", uid.ToString());
+                yield return Bot.WaitRemote(2, "hive_seen", "1", 40f);
+                // Fast-forward the filling, as the garden test does.
+                yield return Bot.WaitUntil("the hive filled", () =>
+                {
+                    var t = tree(uid);
+                    if (full(t)) return true;
+                    if (t != null && t.components?.craft != null && t.components.craft.is_crafting && t.progress < 0.999f) t.progress = 0.999f;
+                    return false;
+                }, 30f);
+                Bot.Step("info full: " + GardenInfo(tree(uid)));
+                Bot.Publish("full", tree(uid)?.obj_id ?? "none");
+                Vector2 at = tree(uid)?.pos ?? me.pos;
+                int mine0 = loot();
+                yield return Bot.WaitUntil("client took the honey", () => Bot.Remote(2, "taken") != null, 90f);
+                string theirs = Bot.Remote(2, "taken");
+                yield return Bot.WaitUntil("the tree looks the same here", () => (tree(uid)?.obj_id ?? "none") == theirs, 20f);
+                yield return Bot.Wait(2f);
+                Bot.Step("info after the client's harvest: " + GardenInfo(tree(uid)));
+                Bot.Check("the honey went only to the client (my bag unchanged)", loot() == mine0, $"{mine0} -> {loot()}");
+                yield return Bot.WaitUntil("the hive fills again (host runs it)", () => tree(uid)?.components?.craft?.is_crafting == true, 10f);
+                Bot.Publish("taken_seen", "1");
+            }
+            else
+            {
+                yield return Bot.WaitUntil("host picked a hive", () => Bot.Remote(1, "hive") != null, 60f);
+                if (Bot.Remote(1, "hive") == "none") yield break;
+                long uid = long.Parse(Bot.Remote(1, "hive"));
+                Bot.Check("the same hive here", tree(uid) != null && tree(uid).obj_id.EndsWith("_bees"), GardenInfo(tree(uid)));
+                Bot.Publish("hive_seen", "1");
+                yield return Bot.WaitUntil("host filled it", () => Bot.Remote(1, "full") != null, 60f);
+                yield return Bot.WaitUntil("full here too", () => full(tree(uid)), 20f);
+                Bot.Step("info full here: " + GardenInfo(tree(uid)));
+                Vector2 at = tree(uid).pos;
+                Func<int> dropsNear = () => BeeLoot.Sum(id => Drops(id).Count(d => Vector2.Distance(d.transform.position, at) < 400f));
+                int have0 = loot(), drops0 = dropsNear();
+                string bag0 = Items(me.data.inventory);
+                yield return WalkUpTo(tree(uid));
+                Bot.Step($"info at the tree: nearest={me.components.interaction.nearest?.obj_id}");
+                me.temp_do_work = true;   // hold the work key, bare hands
+                float t0 = UnityEngine.Time.realtimeSinceStartup;
+                while (full(tree(uid)) && UnityEngine.Time.realtimeSinceStartup - t0 < 30f)
+                {
+                    if (me.energy < 10f) me.energy = 100f;
+                    yield return null;
+                }
+                me.temp_do_work = false;
+                Bot.Check("took the honey", !full(tree(uid)), GardenInfo(tree(uid)));
+                yield return Bot.Wait(2f);
+                int got = loot() - have0 + dropsNear() - drops0;
+                Bot.Step($"info after: {GardenInfo(tree(uid))} bag+{loot() - have0} drops+{dropsNear() - drops0}");
+                Bot.Check("got honey, bees or wax (bag or ground)", got > 0, $"[{bag0}] -> [{Items(me.data.inventory)}]");
+                yield return Bot.Wait(3f);
+                Bot.Check("the tree did not fill again by itself", !full(tree(uid)), GardenInfo(tree(uid)));
+                Bot.Publish("taken", tree(uid)?.obj_id ?? "none");
+                yield return Bot.WaitRemote(1, "taken_seen", "1", 40f);
+                yield return Bot.WaitUntil("the hive fills again here too", () => tree(uid)?.components?.craft?.is_crafting == true, 10f);
+                Bot.Step("info filling again: " + GardenInfo(tree(uid)));
+            }
+        }
+
+        private static IEnumerator WorkOn(Func<bool> until, float seconds)
+        {
+            var me = MainGame.me.player;
+            me.temp_do_work = true;   // holding the work key
+            float t0 = UnityEngine.Time.realtimeSinceStartup;
+            while (!until() && UnityEngine.Time.realtimeSinceStartup - t0 < seconds)
+            {
+                if (me.energy < 10f) me.energy = 100f;
+                yield return null;
+            }
+            me.temp_do_work = false;
+        }
+
+        /// <summary>A bee house from the bee garden: the client places the blueprint at the bee
+        /// table and hammers it together; the host runs the hive and fills it (fast-forwarded);
+        /// the client takes the honey by hand. Both see every stage on the same object.</summary>
+        private static IEnumerator BeeHouse()
+        {
+            var me = MainGame.me.player;
+            Func<Vector2, WorldGameObject> houseAt = at => WorldMap.objs.Where(w => w != null && !w.is_removed && w.obj_id != null && w.obj_id.StartsWith("beehouse_") &&
+                                                                                 w.obj_id != "beehouse_decor" && w.obj_id != "beehouse_broken" && Vector2.Distance(w.pos, at) < 48f)
+                                                                     .FirstOrDefault();
+            Func<WorldGameObject, string> info = w => w == null ? "none" : GardenInfo(w) + $" tools=[{string.Join(",", w.obj_def?.tool_actions?.action_tools ?? new List<ItemDefinition.ItemType>())}]";
+            if (!Bot.IsHost)
+            {
+                var desk = WorldMap.objs.FirstOrDefault(w => w != null && !w.is_removed && w.obj_id == "beegarden_table");
+                var cd = GameBalance.me.GetDataOrNull<ObjectCraftDefinition>("beegarden_table:p:beehouse_place");
+                Bot.Check("the bee table and the bee house recipe", desk != null && cd != null);
+                if (desk == null || cd == null) { Bot.Publish("house", "none"); yield break; }
+                foreach (var n in cd.needs) me.data.AddItem(n.id, n.value);   // stands in for planks, nails and bees gathered earlier
+                if (!me.data.secondary_inventory.Any(i => i?.definition?.type == ItemDefinition.ItemType.Hammer) &&
+                    !me.data.inventory.Any(i => i?.definition?.type == ItemDefinition.ItemType.Hammer))
+                {
+                    var hammer = GameBalance.me.items_data.FirstOrDefault(i => i.type == ItemDefinition.ItemType.Hammer);
+                    Bot.Step("info no hammer, adding " + hammer?.id);
+                    if (hammer != null) me.data.AddItem(hammer.id, 1);
+                }
+                string bag0 = Items(me.data.inventory);
+                yield return WalkUpTo(desk);
+                MainGame.me.OpenBuildObjectGUI(desk);
+                yield return Bot.Wait(1f);
+                object wasGamepad = GamepadActiveF.GetValue(null);
+                GamepadActiveF.SetValue(null, true);
+                MainGame.me.build_mode_logics.CraftBuilding(cd);
+                yield return Bot.Wait(0.5f);
+                Bot.Check("placing a bee house blueprint", BuildMode() == "Placing" && FloatingWorldGameObject.cur_floating != null, BuildMode());
+                var zone = WorldZone.GetZoneByID(desk.obj_def.zone_id);
+                var b = zone.GetBounds();
+                bool free = false;
+                for (float x = b.min.x + 96f; x < b.max.x - 96f && !free; x += 96f)
+                    for (float y = b.min.y + 96f; y < b.max.y - 96f && !free; y += 96f)
+                    {
+                        if (FloatingWorldGameObject.cur_floating == null) break;
+                        FloatingWorldGameObject.MoveCurrentFloatingObject(new Vector2(x, y));
+                        yield return null;
+                        free = FloatingWorldGameObject.can_be_built && MainGame.me.build_mode_logics.CanBuild(cd);
+                    }
+                Bot.Check("a free spot in the bee garden", free);
+                Vector2 at = FloatingWorldGameObject.cur_floating?.wobj != null ? (Vector2)FloatingWorldGameObject.cur_floating.wobj.pos : Vector2.zero;
+                var preview = FloatingWorldGameObject.cur_floating?.wobj;
+                if (free) { yield return FakeInput.Press(GameKey.Interaction); yield return Bot.Wait(1f); }
+                for (int i = 0; i < 4 && (BuildMode() == "Placing" || GUIElements.me.craft.is_shown || MainGame.me.game_mode == MainGame.GameMode.Building); i++)
+                {
+                    yield return FakeInput.Press(GameKey.Back);
+                    yield return Bot.Wait(0.6f);
+                    if (GUIElements.me.craft.is_shown) { GUIElements.me.craft.OnClosePressed(); yield return Bot.Wait(0.6f); }
+                }
+                GamepadActiveF.SetValue(null, wasGamepad);
+                var house = WorldMap.objs.FirstOrDefault(w => w != null && !w.is_removed && w != FloatingWorldGameObject.cur_floating?.wobj && w.obj_id == "beehouse_place" && Vector2.Distance(w.pos, at) < 48f);
+                Bot.Check("blueprint placed", house != null, $"at {V(at)} near: " + string.Join(",", WorldMap.objs.Where(w => w != null && !w.is_removed && w != preview && w.obj_id != null && Vector2.Distance(w.pos, at) < 150f).Select(w => $"{w.obj_id}#{w.unique_id}@{V(w.pos)}")) + $" bag [{Items(me.data.inventory)}]");
+                if (house == null) { Bot.Publish("house", "none"); yield break; }
+                long uid = house.unique_id;
+                Func<WorldGameObject> cur = () => WorldMap.GetWorldGameObjectByUniqueId(uid, false) ?? houseAt(at);
+                Bot.Step("info placed: " + info(house) + $" bag [{bag0}] -> [{Items(me.data.inventory)}]");
+                Bot.Publish("house", $"{uid}|{V(at)}");
+                yield return Bot.WaitRemote(1, "place_seen", "1", 40f);
+
+                // Hammer it together like a player.
+                yield return WalkUpTo(cur());
+                Bot.Step($"info at the blueprint: nearest={me.components.interaction.nearest?.obj_id}");
+                yield return WorkOn(() => cur()?.obj_id != "beehouse_place", 60f);
+                Bot.Check("built the bee house", cur()?.obj_id != "beehouse_place", info(cur()));
+                yield return Bot.Wait(2f);
+                Bot.Step("info built: " + info(cur()));
+                Bot.Publish("built", cur()?.obj_id ?? "none");
+                yield return Bot.WaitUntil("host filled the hive", () => Bot.Remote(1, "full") != null, 120f);
+                string fullId = Bot.Remote(1, "full");
+                yield return Bot.WaitUntil("the hive is full here too", () => cur()?.obj_id == fullId, 20f);
+                Bot.Step("info full here: " + info(cur()));
+
+                // Take the honey by hand.
+                Func<int> loot = () => BeeLoot.Sum(id => me.data.GetTotalCount(id, true));
+                Func<int> dropsNear = () => BeeLoot.Sum(id => Drops(id).Count(d => Vector2.Distance(d.transform.position, at) < 400f));
+                int have0 = loot(), drops0 = dropsNear();
+                yield return WalkUpTo(cur());
+                yield return WorkOn(() => cur()?.obj_id != fullId, 30f);
+                Bot.Check("took the honey", cur()?.obj_id != fullId, info(cur()));
+                yield return Bot.Wait(2f);
+                Bot.Step($"info after: {info(cur())} bag+{loot() - have0} drops+{dropsNear() - drops0}");
+                Bot.Check("got honey or wax (bag or ground)", loot() - have0 + dropsNear() - drops0 > 0, Items(me.data.inventory));
+                Bot.Publish("taken", cur()?.obj_id ?? "none");
+                yield return Bot.WaitRemote(1, "taken_seen", "1", 40f);
+            }
+            else
+            {
+                yield return Bot.WaitUntil("client placed a bee house", () => Bot.Remote(2, "house") != null, 90f);
+                if (Bot.Remote(2, "house") == "none") yield break;
+                var p = Bot.Remote(2, "house").Split('|');
+                long uid = long.Parse(p[0]); Vector2 at = ParseV(p[1]);
+                Func<WorldGameObject> cur = () => WorldMap.GetWorldGameObjectByUniqueId(uid, false) ?? houseAt(at);
+                yield return Bot.WaitUntil("the blueprint is here", () => cur()?.obj_id == "beehouse_place", 20f);
+                Bot.Step("info blueprint here: " + info(cur()));
+                Bot.Publish("place_seen", "1");
+                yield return Bot.WaitUntil("client built it", () => Bot.Remote(2, "built") != null, 120f);
+                string built = Bot.Remote(2, "built");
+                yield return Bot.WaitUntil("the bee house is built here too", () => cur()?.obj_id == built, 20f);
+                int copies = WorldMap.objs.Count(w => w != null && !w.is_removed && w.obj_id != null && w.obj_id.StartsWith("beehouse_") && Vector2.Distance(w.pos, at) < 48f);
+                Bot.Check("exactly one bee house there", copies == 1, copies.ToString());
+                Bot.Step("info built here: " + info(cur()));
+                yield return Bot.WaitUntil("the new bee house starts making honey", () => cur()?.components?.craft?.is_crafting == true, 10f);
+                // The host runs the hive: wait for it to start, then fast-forward until it is full.
+                yield return Bot.WaitUntil("the bee house fills", () =>
+                {
+                    var w = cur();
+                    if (w == null) return false;
+                    if (w.obj_id == "beehouse_2") return true;
+                    if (w.components?.craft != null && w.components.craft.is_crafting && w.progress < 0.999f) w.progress = 0.999f;
+                    return false;
+                }, 60f);
+                Bot.Step("info full: " + info(cur()));
+                Bot.Publish("full", cur()?.obj_id ?? "none");
+                Func<int> loot = () => BeeLoot.Sum(id => me.data.GetTotalCount(id, true));
+                int mine0 = loot();
+                yield return Bot.WaitUntil("client took the honey", () => Bot.Remote(2, "taken") != null, 90f);
+                string theirs = Bot.Remote(2, "taken");
+                yield return Bot.WaitUntil("the bee house looks the same here", () => (cur()?.obj_id ?? "none") == theirs, 20f);
+                yield return Bot.Wait(2f);
+                Bot.Step("info after the client's harvest: " + info(cur()));
+                Bot.Check("the honey went only to the client (my bag unchanged)", loot() == mine0, $"{mine0} -> {loot()}");
+                yield return Bot.WaitUntil("the bee house makes honey again", () => cur()?.components?.craft?.is_crafting == true, 10f);
+                Bot.Step("info working again: " + info(cur()));
+                Bot.Publish("taken_seen", "1");
+            }
+        }
+
+        private static readonly string[] SceneCrowd = { "npc_inquisitor", "npc_guard_3", "npc_citizen_1", "npc_citizen_2", "npc_citizen_5" };
+
+        // The spectators are ordinary citizens spawned with the tag npc_burger_eater_N.
+        private static List<WorldGameObject> BurgerEaters() =>
+            WorldMap.objs.Where(w => w != null && !w.is_removed && w.custom_tag != null && w.custom_tag.StartsWith("npc_burger_eater")).ToList();
+
+        /// <summary>What the client's NPC mirror holds for an NPC: the last position from the host.</summary>
+        private static string NpcMirror(WorldGameObject w)
+        {
+            var sync = GraveyardKeeperCoop.Multiplayer.NpcVisualSync.Instance;
+            if (sync == null || w == null) return "-";
+            var states = HarmonyLib.AccessTools.Field(sync.GetType(), "targetStates").GetValue(sync) as System.Collections.IDictionary;
+            var st = states?[w.unique_id];
+            if (st == null) return "no mirror";
+            var t = st.GetType();
+            var last = (Vector3)HarmonyLib.AccessTools.Field(t, "LastReceivedPosition").GetValue(st);
+            var samples = HarmonyLib.AccessTools.Field(t, "PositionSamples").GetValue(st) as System.Collections.IList;
+            return $"last={V(last)} samples={samples?.Count} epoch={HarmonyLib.AccessTools.Field(t, "PuppetEpoch").GetValue(st)}";
+        }
+
+        /// <summary>"tag@x;y active" for the fixed NPCs of the burning scene.</summary>
+        private static Dictionary<string, string> CrowdState() =>
+            SceneCrowd.ToDictionary(t => t, t =>
+            {
+                var w = WorldMap.GetWorldGameObjectByCustomTag(t);
+                return w == null ? "none" : $"{V(w.pos)}|{w.gameObject.activeInHierarchy}";
+            });
+
+        /// <summary>A story scene with a crowd: the weekly witch burning on the witch hill
+        /// (inquisitor, a guard, three citizens and eight spawned spectators). One player
+        /// starts it and clicks through it, the other watches. Both must see the scene, both
+        /// get control back, the spectators leave on both sides, the fixed crowd ends up in
+        /// the same places, and the reward goes to the initiator only.</summary>
+        private static IEnumerator Scene(int initiator)
+        {
+            InstallBubbleHook();
+            var me = MainGame.me.player;
+            Bot.KeepAlive = true;   // the hill has night monsters too
+            var pylon = WorldMap.GetWorldGameObjectByCustomTag("witch_pylon");
+            Bot.Require("the witch pylon", pylon != null);
+            // Stand at the foot of the hill, a little apart.
+            me.PlaceAtPos((Vector2)pylon.pos + new Vector2(Plugin.Player == 1 ? -150f : 150f, -500f));
+            yield return Bot.Wait(2f);
+            float money0 = me.data.money;
+            bubblesSeen.Clear();
+            Bot.Step("info crowd before: " + string.Join(" ", CrowdState().Select(kv => kv.Key + "=" + kv.Value)) + $" pylon={pylon.obj_id}");
+            yield return Bot.Sync("scene_ready");
+            bool lostControl = false; int maxEaters = 0;
+            float t0 = UnityEngine.Time.realtimeSinceStartup, quiet = t0, lastNote = 0f;
+            Action watch = () =>
+            {
+                if (!CanMove()) lostControl = true;
+                maxEaters = Math.Max(maxEaters, BurgerEaters().Count);
+            };
+            if (Plugin.Player == initiator)
+            {
+                var script = GS.RunFlowScript("witch_tasty_burning");
+                Bot.Check("the scene started", script != null);
+                int presses = 0, answersPicked = 0;
+                while (UnityEngine.Time.realtimeSinceStartup - quiet < 6f && UnityEngine.Time.realtimeSinceStartup - t0 < 240f)
+                {
+                    watch();
+                    var answers = OpenAnswers();
+                    if (answers != null && answers.Count > 0)
+                    {
+                        yield return Bot.Wait(0.8f);
+                        answers.First(a => a != null).OnChosen();
+                        answersPicked++;
+                        quiet = UnityEngine.Time.realtimeSinceStartup;
+                        continue;
+                    }
+                    if (ActiveBubble() != null)
+                    {
+                        yield return Bot.Wait(0.7f);
+                        yield return FakeInput.Press(GameKey.Select);
+                        presses++;
+                        quiet = UnityEngine.Time.realtimeSinceStartup;
+                        continue;
+                    }
+                    if (!CanMove()) quiet = UnityEngine.Time.realtimeSinceStartup;
+                    if (UnityEngine.Time.realtimeSinceStartup - lastNote > 10f)
+                    {
+                        lastNote = UnityEngine.Time.realtimeSinceStartup;
+                        Bot.Step($"info scene running: canMove={CanMove()} eaters={BurgerEaters().Count} windows=[{string.Join(",", BaseGUI.opened_windows.Select(w => w.GetType().Name))}]");
+                    }
+                    yield return null;
+                }
+                Bot.Step($"info scene over after {UnityEngine.Time.realtimeSinceStartup - t0:F0}s: {bubblesSeen.Count} lines, {presses} clicks, {answersPicked} answers, lost control={lostControl}, spectators max {maxEaters}");
+                foreach (var b in bubblesSeen.Take(8)) Bot.Step("     line " + b);
+                Bot.Check("the scene played here (control taken)", lostControl);
+                Bot.Publish("scene_done", string.Join("\u0001", bubblesSeen));
+                // Vanilla: the citizens start walking home a few seconds after the scene.
+                for (int i = 0; i < 6; i++)
+                {
+                    Bot.Step("info tail+" + i * 2 + "s: " + string.Join(" ", new[] { "npc_citizen_1", "npc_citizen_2", "npc_citizen_5" }.Select(t =>
+                    {
+                        var w = WorldMap.GetWorldGameObjectByCustomTag(t);
+                        var mc = w?.components?.character;
+                        return w == null ? t + "=none" : $"{t}@{V(w.pos)} moving={(mc != null && !mc.IsStopped)} state={mc?.movement_state} dest={(mc?.astar != null ? V(mc.astar.destination) : "-")}";
+                    })));
+                    yield return Bot.Wait(2f);
+                }
+            }
+            else
+            {
+                while (Bot.Remote(initiator, "scene_done") == null && UnityEngine.Time.realtimeSinceStartup - t0 < 260f)
+                {
+                    watch();
+                    if (UnityEngine.Time.realtimeSinceStartup - lastNote > 10f)
+                    {
+                        lastNote = UnityEngine.Time.realtimeSinceStartup;
+                        Bot.Step($"info watching: canMove={CanMove()} eaters={BurgerEaters().Count} lines={bubblesSeen.Count}");
+                    }
+                    yield return null;
+                }
+                Bot.Step($"info watched: {bubblesSeen.Count} lines, lost control={lostControl}, spectators max {maxEaters}");
+                Bot.Check("saw the scene (spectators or lines)", maxEaters > 0 || bubblesSeen.Count > 0);
+                var theirs = (Bot.Remote(initiator, "scene_done") ?? "").Split('\u0001').Where(x => x.Length > 0).ToList();
+                Func<string, string> text = l => l.Substring(l.IndexOf(": ") + 2);
+                var missing = theirs.Select(text).Where(l => !bubblesSeen.Select(text).Contains(l)).ToList();
+                Bot.Check("saw the same lines", missing.Count == 0, missing.Count == 0 ? "" : $"missing {missing.Count}/{theirs.Count}: " + string.Join(" | ", missing.Take(4)));
+            }
+            yield return Bot.Sync("scene_over", 120f);
+            yield return Bot.WaitUntil("can move again after the scene", CanMove, 15f);
+            yield return Bot.WaitUntil("the spectators left", () => BurgerEaters().Count(w => w.gameObject.activeInHierarchy) == 0, 30f);
+            yield return Bot.Wait(5f);   // let the crowd walk back
+            var crowd = CrowdState();
+            Bot.Step("info crowd after: " + string.Join(" ", crowd.Select(kv => kv.Key + "=" + kv.Value)));
+            if (!Bot.IsHost)
+                foreach (var t in SceneCrowd)
+                {
+                    var w = WorldMap.GetWorldGameObjectByCustomTag(t);
+                    Bot.Step($"info mirror {t}#{w?.unique_id}: {NpcMirror(w)}");
+                }
+            float gained = me.data.money - money0;
+            Bot.Step($"info money {F(money0)} -> {F(me.data.money)}");
+            if (Plugin.Player == initiator) Bot.Check("the initiator got the reward", gained > 0f, F(gained));
+            else Bot.Check("the watcher got no reward", Mathf.Abs(gained) < 0.001f, F(gained));
+            Func<string> crowdLine = () => string.Join(" ", CrowdState().Select(kv => kv.Key + "=" + kv.Value));
+            if (Bot.IsHost)
+            {
+                yield return Bot.WaitUntil("partner reported the crowd", () => Bot.Remote(2, "crowd") != null, 60f);
+                Func<string, Dictionary<string, string>> parse = x => x.Split(' ').Select(e => e.Split('=')).ToDictionary(a => a[0], a => a[1]);
+                var off = new List<string>();
+                // The client mirrors the host's NPCs a little behind; within two tiles is the same place.
+                yield return Bot.WaitUntil("the crowd stands in the same places", () =>
+                {
+                    off.Clear();
+                    string r = Bot.Remote(2, "crowd");
+                    if (r == null) { off.Add("no report"); return false; }
+                    var theirs = parse(r);
+                    foreach (var kv in CrowdState())
+                    {
+                        string t; theirs.TryGetValue(kv.Key, out t);
+                        if (kv.Value == "none" || t == null || t == "none") { if (kv.Value != t) off.Add($"{kv.Key} here {kv.Value} there {t}"); continue; }
+                        // Only the place counts: whether an object is switched on follows each player's own camera.
+                        var x = kv.Value.Split('|'); var y = t.Split('|');
+                        if (Vector2.Distance(ParseV(x[0]), ParseV(y[0])) > 192f) off.Add($"{kv.Key} here {kv.Value} there {t}");
+                    }
+                    return off.Count == 0;
+                }, 30f);
+                if (off.Count > 0) Bot.Step("info differs: " + string.Join("; ", off));
+                Bot.Publish("crowd_compared", "1");
+            }
+            else
+            {
+                // Keep reporting until the host has compared: the crowd is still walking.
+                float c0 = UnityEngine.Time.realtimeSinceStartup;
+                while (Bot.Remote(1, "crowd_compared") == null && UnityEngine.Time.realtimeSinceStartup - c0 < 120f)
+                {
+                    Bot.Publish("crowd", crowdLine());
+                    yield return Bot.Wait(1f);
+                }
+            }
+            yield return Bot.Sync("scene_end");
+            if (!Bot.IsHost)
+                foreach (var t in SceneCrowd)
+                {
+                    var w = WorldMap.GetWorldGameObjectByCustomTag(t);
+                    Bot.Step($"info later {t}: {(w == null ? "none" : V(w.pos) + " active=" + w.gameObject.activeInHierarchy)} mirror {NpcMirror(w)}");
+                }
         }
 
         private static IEnumerator NetHiccups()
@@ -1662,11 +2122,11 @@ namespace CoopQA
             bubblesSeen.Add($"{(is_player ? "player" : w?.obj_id ?? speaker_id.ToString())}: {txt}");
         }
 
-        private static SpeechBubbleGUI ActiveBubble() =>
+        internal static SpeechBubbleGUI ActiveBubble() =>
             SpeechBubbleGUI.all.Values.FirstOrDefault(b => b != null && b.gameObject.activeInHierarchy &&
                                                            !(bool)HarmonyLib.AccessTools.Field(typeof(SpeechBubbleGUI), "_disappearing").GetValue(b));
 
-        private static List<MultiAnswerOptionGUI> OpenAnswers()
+        internal static List<MultiAnswerOptionGUI> OpenAnswers()
         {
             var cur = HarmonyLib.AccessTools.Field(typeof(MultiAnswerGUI), "_current").GetValue(null) as MultiAnswerGUI;
             if (cur == null || !cur.gameObject.activeInHierarchy) return null;
@@ -1674,7 +2134,7 @@ namespace CoopQA
             return list != null && list.Count > 0 && list.Any(a => a != null) ? list : null;
         }
 
-        private static bool CanMove()
+        internal static bool CanMove()
         {
             var pc = MainGame.me.player_char;
             return !(bool)HarmonyLib.AccessTools.Method(typeof(BaseCharacterComponent), "PlayerControlIsDisabled").Invoke(pc, null);

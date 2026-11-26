@@ -171,16 +171,16 @@ def main():
         sys.exit("no fixture save found")
 
     out = QA / "runs" / (time.strftime("%Y%m%d-%H%M%S") + "-" + a.test.split(":")[0])
-    if a.test == "hud_probe":
+    if a.test in ("hud_probe", "solo_scene"):
         # Single player, one instance: compare the HUD with and without the mod.
         out.mkdir(parents=True)
         import threading
         for label, with_mod in (("vanilla", False), ("with_mod", True)):
             d1 = prepare(1, fixture, "1", with_mod=with_mod)
-            p = launch(1, d1, "hud_probe", out, a.port, "1", label=label)
+            p = launch(1, d1, a.test, out, a.port, "1", label=label)
             threading.Thread(target=place_windows, args=([p.pid], a.workspace), daemon=True).start()
             t0 = time.time()
-            res = out / f"hud_{label}.txt"
+            res = out / (f"hud_{label}.txt" if a.test == "hud_probe" else f"scene_{label}.txt")
             while time.time() - t0 < 600 and p.poll() is None and not res.exists():
                 time.sleep(1)
             time.sleep(1)

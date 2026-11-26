@@ -3265,16 +3265,53 @@ namespace GraveyardKeeperCoop.Multiplayer
                 return;
             }
 
+            // A client that finishes an object (hammers a blueprint together, takes the
+            // honey from a hive) runs DoZeroHPActivity, which replaces the object and then
+            // starts the def's craft_after_hp_0 (the new hive starts making honey). The host
+            // only receives the replacement, so it must start that craft itself; otherwise
+            // its idle state overwrites the client's and the object never works again.
+            string craftAfterZeroHp = CraftAfterZeroHp(current, replacement.ObjId);
+
             WorldGameObject target =
                 ApplyWgoReplacement(replacement, "client request");
             if (target == null)
                 return;
+
+            if (craftAfterZeroHp != null &&
+                target.components?.craft != null &&
+                !target.components.craft.is_crafting)
+            {
+                target.TryStartCraft(craftAfterZeroHp);
+                CoopMod.Logger.LogInfo(
+                    $"{LogPrefix} Starting '{craftAfterZeroHp}' on {target.obj_id} " +
+                    $"(uid={target.unique_id}) after the client finished {current.obj_id}");
+            }
 
             SendWgoReplaced(replacement.OldUniqueId, target);
             CoopMod.Logger.LogInfo(
                 $"{LogPrefix} Host canonicalized WGO replacement from {senderID}: " +
                 $"old_uid={replacement.OldUniqueId}, " +
                 $"new_uid={target.unique_id}, obj_id={target.obj_id}");
+        }
+
+        /// <summary>The craft the game starts after <paramref name="current"/> reaches zero HP
+        /// and turns into <paramref name="newObjId"/>, or null when this replacement is not
+        /// that zero-HP transition.</summary>
+        private static string CraftAfterZeroHp(WorldGameObject current, string newObjId)
+        {
+            ObjectDefinition def = current?.obj_def;
+            if (def == null || string.IsNullOrEmpty(def.craft_after_hp_0) ||
+                current.obj_id == newObjId)
+                return null;
+            try
+            {
+                string afterZeroHp = def.after_hp_0?.GetValue(current, MainGame.me?.player);
+                return afterZeroHp == newObjId ? def.craft_after_hp_0 : null;
+            }
+            catch (Exception)
+            {
+                return null;
+            }
         }
 
         private const float DuplicateReplacementSeconds = 5f;

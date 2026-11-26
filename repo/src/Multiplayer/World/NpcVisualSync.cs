@@ -141,6 +141,8 @@ namespace GraveyardKeeperCoop.Multiplayer
             {
                 SteamP2PManager.Instance.OnNpcVisualSyncReceived -= OnNpcVisualSyncReceived;
                 SteamP2PManager.Instance.OnNpcVisualSyncReceived += OnNpcVisualSyncReceived;
+                SteamP2PManager.Instance.OnNpcHandoffGoToReceived -= OnNpcHandoffGoToReceived;
+                SteamP2PManager.Instance.OnNpcHandoffGoToReceived += OnNpcHandoffGoToReceived;
             }
         }
 
@@ -149,6 +151,7 @@ namespace GraveyardKeeperCoop.Multiplayer
             if (SteamP2PManager.Instance != null)
             {
                 SteamP2PManager.Instance.OnNpcVisualSyncReceived -= OnNpcVisualSyncReceived;
+                SteamP2PManager.Instance.OnNpcHandoffGoToReceived -= OnNpcHandoffGoToReceived;
             }
         }
 
@@ -190,6 +193,7 @@ namespace GraveyardKeeperCoop.Multiplayer
             localCutsceneActors.Clear();
             hostEpochActors.Clear();
             pendingFinalPoseActors.Clear();
+            handoffActors.Clear();
             ghostDepthCaptureLogged = false;
             ghostDepthApplyLogged = false;
             ResetDiagnostics();
@@ -355,6 +359,8 @@ namespace GraveyardKeeperCoop.Multiplayer
                 foreach (long uniqueId in hostEpochActors)
                     pendingFinalPoseActors.Add(uniqueId);
                 hostEpochActors.Clear();
+                if (!IsHost)
+                    BeginActorHandoff();
                 localCutsceneActors.Clear();
                 CoopMod.Logger.LogInfo(
                     $"{LogPrefix} Ended cutscene motion epoch {activePuppetEpoch}");
@@ -362,6 +368,124 @@ namespace GraveyardKeeperCoop.Multiplayer
             }
 
             return true;
+        }
+
+        // ---------------------------------------------------------------- actor hand-off
+        // A scene a client plays moves its NPCs on the client only; the host mirrors them.
+        // When the scene ends, the vanilla script and the NPCs' own behaviour send the actors
+        // on (the witch-burning crowd walks home a few seconds later), but by then the host
+        // owns NPC movement again and the client's mirror pins them where the host's copy
+        // stopped. So for a short while after its scene the client tells the host where its
+        // actors were sent, and the host walks its copies there.
+        private const float ActorHandoffSeconds = 30f;
+        private const float HandoffSameDestination = 48f;
+        private readonly Dictionary<long, float> handoffActors = new Dictionary<long, float>();
+
+        private void BeginActorHandoff()
+        {
+            float now = Time.realtimeSinceStartup;
+            foreach (WorldGameObject actor in localCutsceneActors.Values)
+            {
+                if (!ShouldSyncNpc(actor) || actor.unique_id == 0L) continue;
+                handoffActors[actor.unique_id] = now;
+                MovementComponent movement = actor.components?.character;
+                if (movement != null && !movement.IsStopped &&
+                    movement.movement_state == MovementComponent.MovementState.GoTo &&
+                    movement.astar != null)
+                {
+                    SendActorHandoff(actor, movement.astar.destination);
+                }
+            }
+        }
+
+        /// <summary>Called after a local MovementComponent.GoTo on any object.</summary>
+        internal void OnLocalGoTo(WorldGameObject wgo, Vector2 destination)
+        {
+            if (IsHost || wgo == null || !IsSyncEnabled || handoffActors.Count == 0) return;
+            if (!handoffActors.TryGetValue(wgo.unique_id, out float since)) return;
+            if (Time.realtimeSinceStartup - since > ActorHandoffSeconds)
+            {
+                handoffActors.Remove(wgo.unique_id);
+                return;
+            }
+            if (HasLocalNpcVisualAuthority()) return;   // a new local scene drives it itself
+            SendActorHandoff(wgo, destination);
+        }
+
+        private void SendActorHandoff(WorldGameObject wgo, Vector2 destination)
+        {
+            using (var ms = new System.IO.MemoryStream())
+            using (var w = new System.IO.BinaryWriter(ms))
+            {
+                w.Write(wgo.unique_id);
+                w.Write(wgo.obj_id ?? string.Empty);
+                w.Write(wgo.custom_tag ?? string.Empty);
+                w.Write(wgo.transform.position.x);
+                w.Write(wgo.transform.position.y);
+                w.Write(destination.x);
+                w.Write(destination.y);
+                w.Flush();
+                SteamP2PManager.Instance?.SendNpcHandoffGoToHost(ms.ToArray());
+            }
+            CoopMod.Logger.LogInfo(
+                $"{LogPrefix} Handing off {wgo.obj_id} (uid={wgo.unique_id}) to the host: going to {destination}");
+        }
+
+        private void OnNpcHandoffGoToReceived(CSteamID senderID, byte[] payload)
+        {
+            if (!IsHost || !IsSyncEnabled || payload == null || payload.Length > 1024) return;
+            long uid; string objId, tag; Vector3 at; Vector2 destination;
+            try
+            {
+                using (var ms = new System.IO.MemoryStream(payload))
+                using (var r = new System.IO.BinaryReader(ms))
+                {
+                    uid = r.ReadInt64();
+                    objId = r.ReadString();
+                    tag = r.ReadString();
+                    at = new Vector3(r.ReadSingle(), r.ReadSingle(), 0f);
+                    destination = new Vector2(r.ReadSingle(), r.ReadSingle());
+                }
+            }
+            catch (Exception)
+            {
+                return;
+            }
+
+            // Another player's scene is still driving the NPCs: its own end will hand off.
+            if (HasRemoteNpcVisualAuthority() && !IsRemoteNpcVisualAuthority(senderID)) return;
+            WorldGameObject wgo = WGORegistry.Instance?.Resolve(uid, objId, tag, at, 192f) ??
+                                  WorldMap.GetWorldGameObjectByUniqueId(uid, false);
+            if (!ShouldSyncNpc(wgo)) return;
+            MovementComponent movement = wgo.components?.character;
+            if (movement == null) return;
+            if (!movement.IsStopped && movement.movement_state == MovementComponent.MovementState.GoTo &&
+                movement.astar != null &&
+                Vector2.Distance(movement.astar.destination, destination) < HandoffSameDestination)
+            {
+                return;
+            }
+
+            // The copy was moved here as a puppet and nothing on the host keeps it awake
+            // (on the client the scene's script did). An inactive object does not update,
+            // so keep it active while it walks, as the game does for scripted movement.
+            ChunkedGameObject chunk = wgo.GetComponent<ChunkedGameObject>() ??
+                                      wgo.GetComponentInChildren<ChunkedGameObject>(true);
+            if (chunk != null)
+            {
+                chunk.RecalculateChunk();
+                chunk.active_now_because_of_movement = true;
+            }
+            if (!wgo.gameObject.activeSelf)
+                wgo.gameObject.SetActive(true);
+            GJCommons.VoidDelegate settle = () =>
+            {
+                if (chunk != null) chunk.active_now_because_of_movement = false;
+            };
+            movement.GoTo(destination, on_complete: settle, on_failed: settle);
+            CoopMod.Logger.LogInfo(
+                $"{LogPrefix} {SteamFriends.GetFriendPersonaName(senderID)}'s scene sent {wgo.obj_id} " +
+                $"(uid={wgo.unique_id}) to {destination}; walking the host copy there (active={wgo.gameObject.activeInHierarchy})");
         }
 
         private static bool IsClientPuppetWindowActive()
